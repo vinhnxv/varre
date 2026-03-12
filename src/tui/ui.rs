@@ -1,3 +1,4 @@
+use unicode_width::UnicodeWidthStr;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -160,7 +161,7 @@ fn render_prompt_input(f: &mut Frame, area: Rect, app: &App) {
 
     // Show cursor in Insert mode
     if app.input_mode == InputMode::Insert {
-        let x = area.x + 1 + app.input_buffer.len() as u16;
+        let x = area.x + 1 + app.input_buffer.width() as u16;
         let y = area.y + 1;
         f.set_cursor_position((x, y));
     }

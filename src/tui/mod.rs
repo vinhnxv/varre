@@ -200,9 +200,7 @@ async fn handle_key_event<B: crate::backend::ClaudeBackend>(
                 // Create new interactive session with unique name
                 let mut n = app.sessions.len() + 1;
                 let mut name = format!("agent-{n}");
-                let existing: std::collections::HashSet<&str> =
-                    app.sessions.iter().map(|s| s.name.as_str()).collect();
-                while existing.contains(name.as_str()) {
+                while orchestrator.has_session(&name) {
                     n += 1;
                     name = format!("agent-{n}");
                 }

@@ -396,6 +396,11 @@ impl<B: ClaudeBackend> Orchestrator<B> {
         &self.cancel_token
     }
 
+    /// Check if a session name already exists.
+    pub fn has_session(&self, name: &str) -> bool {
+        self.names.contains_key(name)
+    }
+
     /// Reset the circuit breaker, allowing requests to flow again.
     pub fn reset_circuit_breaker(&self) {
         self.consecutive_failures.store(0, Ordering::Relaxed);
