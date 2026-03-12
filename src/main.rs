@@ -35,7 +35,7 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::New { name, mode, dir } => {
-            let backend = Arc::new(CliBackend::new());
+            let backend = Arc::new(CliBackend::with_binary(&config.claude.binary));
             let mut orch = Orchestrator::new(config, backend, cancel_token)?;
             match mode.as_str() {
                 "headless" => {
@@ -59,7 +59,7 @@ async fn main() -> Result<()> {
             prompt,
             stream: _,
         } => {
-            let backend = Arc::new(CliBackend::new());
+            let backend = Arc::new(CliBackend::with_binary(&config.claude.binary));
             let mut orch = Orchestrator::new(config, backend, cancel_token)?;
             let response = orch.send_prompt(&name, &prompt).await?;
             println!("{}", response.result);
@@ -69,7 +69,7 @@ async fn main() -> Result<()> {
         }
 
         Commands::List => {
-            let backend = Arc::new(CliBackend::new());
+            let backend = Arc::new(CliBackend::with_binary(&config.claude.binary));
             let orch = Orchestrator::new(config, backend, cancel_token)?;
             let sessions = orch.list_sessions().await;
             if sessions.is_empty() {
@@ -92,7 +92,7 @@ async fn main() -> Result<()> {
         }
 
         Commands::Kill { name, force: _ } => {
-            let backend = Arc::new(CliBackend::new());
+            let backend = Arc::new(CliBackend::with_binary(&config.claude.binary));
             let mut orch = Orchestrator::new(config, backend, cancel_token)?;
             orch.kill_session(&name).await?;
             println!("killed session '{name}'");
@@ -121,7 +121,7 @@ async fn main() -> Result<()> {
 
                 QueueCommands::Run { concurrency: _ } => {
                     let queue = PromptQueue::load(&queue_path)?;
-                    let backend = Arc::new(CliBackend::new());
+                    let backend = Arc::new(CliBackend::with_binary(&config.claude.binary));
                     let queue_arc = Arc::new(tokio::sync::Mutex::new(queue));
                     let runner = QueueRunner::new(queue_arc.clone(), backend);
                     let status = runner.run_all(cancel_token).await?;
@@ -184,14 +184,14 @@ async fn main() -> Result<()> {
         },
 
         Commands::Capture { name, lines } => {
-            let backend = Arc::new(CliBackend::new());
+            let backend = Arc::new(CliBackend::with_binary(&config.claude.binary));
             let orch = Orchestrator::new(config, backend, cancel_token)?;
             let output = orch.capture_output(&name, lines.unwrap_or(50)).await?;
             println!("{output}");
         }
 
         Commands::Tui => {
-            let backend = Arc::new(CliBackend::new());
+            let backend = Arc::new(CliBackend::with_binary(&config.claude.binary));
             let mut orch = Orchestrator::new(config.clone(), backend, cancel_token.clone())?;
             tui::run(config, &mut orch, cancel_token).await?;
         }

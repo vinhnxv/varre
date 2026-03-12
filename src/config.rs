@@ -29,6 +29,8 @@ pub enum SessionMode {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ClaudeConfig {
+    /// Path to the claude binary (default: "claude", auto-detected at startup).
+    pub binary: String,
     pub allowed_tools: Vec<String>,
     pub max_turns: u32,
     pub max_budget_usd: f64,
@@ -74,12 +76,29 @@ impl Default for DefaultsConfig {
 impl Default for ClaudeConfig {
     fn default() -> Self {
         Self {
+            binary: detect_claude_binary(),
             allowed_tools: vec!["Read".into(), "Edit".into(), "Bash".into()],
             max_turns: 50,
             max_budget_usd: 5.0,
             model: "sonnet".into(),
         }
     }
+}
+
+/// Auto-detect the claude binary path.
+/// Checks common native installer locations before falling back to "claude".
+fn detect_claude_binary() -> String {
+    let candidates = [
+        // Native installer locations
+        dirs::home_dir().map(|h| h.join(".local/bin/claude")),
+        dirs::home_dir().map(|h| h.join(".claude/bin/claude")),
+    ];
+    for candidate in candidates.into_iter().flatten() {
+        if candidate.exists() {
+            return candidate.to_string_lossy().into_owned();
+        }
+    }
+    "claude".into()
 }
 
 impl Default for TmuxConfig {

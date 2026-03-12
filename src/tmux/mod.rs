@@ -262,11 +262,11 @@ impl TmuxWrapper {
         Ok(sessions)
     }
 
-    /// Start Claude Code in a tmux session.
-    pub async fn start_claude(&self, name: &str) -> Result<()> {
+    /// Start Claude Code in a tmux session using the given binary path.
+    pub async fn start_claude_with_binary(&self, name: &str, binary: &str) -> Result<()> {
         let full_name = self.session_name(name);
         let output = Command::new("tmux")
-            .args(["send-keys", "-t", &full_name, "claude", "Enter"])
+            .args(["send-keys", "-t", &full_name, binary, "Enter"])
             .output()
             .await
             .context("failed to start claude in tmux")?;
@@ -277,6 +277,11 @@ impl TmuxWrapper {
         }
 
         Ok(())
+    }
+
+    /// Start Claude Code in a tmux session (uses "claude" from PATH).
+    pub async fn start_claude(&self, name: &str) -> Result<()> {
+        self.start_claude_with_binary(name, "claude").await
     }
 
     /// Return the prompt marker used for detection.

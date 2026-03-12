@@ -103,8 +103,8 @@ impl<B: ClaudeBackend> Orchestrator<B> {
         let session = InteractiveSession::new(dir, self.config.claude.clone(), tmux.clone());
         let id = session.id.clone();
 
-        // Start Claude Code in the tmux session
-        tmux.start_claude(name).await?;
+        // Start Claude Code in the tmux session using configured binary path
+        tmux.start_claude_with_binary(name, &self.config.claude.binary).await?;
 
         // Transition Creating -> Ready
         session

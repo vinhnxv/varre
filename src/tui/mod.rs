@@ -197,8 +197,15 @@ async fn handle_key_event<B: crate::backend::ClaudeBackend>(
                 app.status_message = None;
             }
             KeyCode::Char('n') => {
-                // Create new interactive session
-                let name = format!("agent-{}", app.sessions.len() + 1);
+                // Create new interactive session with unique name
+                let mut n = app.sessions.len() + 1;
+                let mut name = format!("agent-{n}");
+                let existing: std::collections::HashSet<&str> =
+                    app.sessions.iter().map(|s| s.name.as_str()).collect();
+                while existing.contains(name.as_str()) {
+                    n += 1;
+                    name = format!("agent-{n}");
+                }
                 match orchestrator
                     .create_interactive_session(&name, None)
                     .await
