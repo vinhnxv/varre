@@ -1,0 +1,7 @@
+tmp/
+.claude/echoes/
+
+
+# Added by cargo
+
+/target
