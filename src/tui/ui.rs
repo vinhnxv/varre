@@ -23,19 +23,21 @@ pub fn render(f: &mut Frame, app: &App) {
 
     let area = f.area();
 
-    // Main layout: header + body + status bar
+    // Main layout: header + body + prompt + status bar
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1), // header
-            Constraint::Min(10),  // body
+            Constraint::Min(10),  // body (sidebar + output)
+            Constraint::Length(3), // prompt input
             Constraint::Length(1), // status bar
         ])
         .split(area);
 
     render_header(f, chunks[0], app);
     render_body(f, chunks[1], app);
-    render_status_bar(f, chunks[2], app);
+    render_prompt_input(f, chunks[2], app);
+    render_status_bar(f, chunks[3], app);
 }
 
 fn render_header(f: &mut Frame, area: Rect, _app: &App) {
@@ -99,17 +101,7 @@ fn render_sidebar(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_main_panel(f: &mut Frame, area: Rect, app: &App) {
-    // Split main panel into output + prompt input
-    let main_chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(5),   // output
-            Constraint::Length(3), // prompt input
-        ])
-        .split(area);
-
-    render_output(f, main_chunks[0], app);
-    render_prompt_input(f, main_chunks[1], app);
+    render_output(f, area, app);
 }
 
 fn render_output(f: &mut Frame, area: Rect, app: &App) {
@@ -142,20 +134,47 @@ fn render_output(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_prompt_input(f: &mut Frame, area: Rect, app: &App) {
-    let (title, style) = match app.input_mode {
-        InputMode::Normal => (
-            " Prompt (press 'i' to type) ",
-            Style::default().fg(Color::DarkGray),
-        ),
+    let has_sessions = !app.sessions.is_empty();
+
+    let (title, text_style, border_style, hint) = match app.input_mode {
+        InputMode::Normal => {
+            let hint = if !has_sessions {
+                "Press 'n' to create a new Claude Code session"
+            } else {
+                "Press 'i' to type a prompt for the selected session"
+            };
+            (
+                " Instructions ",
+                Style::default().fg(Color::DarkGray),
+                Style::default().fg(Color::Gray),
+                Some(hint),
+            )
+        }
         InputMode::Insert => (
             " Prompt (Enter to send, Esc to cancel) ",
             Style::default().fg(Color::White),
+            Style::default().fg(Color::Yellow),
+            None,
         ),
     };
 
-    let input = Paragraph::new(app.input_buffer.as_str())
-        .style(style)
-        .block(Block::default().borders(Borders::ALL).title(title));
+    let content = if app.input_buffer.is_empty() {
+        if let Some(msg) = hint {
+            Paragraph::new(msg)
+                .style(Style::default().fg(Color::Gray).add_modifier(Modifier::ITALIC))
+        } else {
+            Paragraph::new("").style(text_style)
+        }
+    } else {
+        Paragraph::new(app.input_buffer.as_str()).style(text_style)
+    };
+
+    let input = content.block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(border_style)
+            .title(title),
+    );
 
     f.render_widget(input, area);
 
