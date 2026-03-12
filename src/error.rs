@@ -8,6 +8,10 @@ pub enum VarreError {
     InvalidTransition { from: String, event: String },
     ClaudeNotFound,
     TmuxNotFound,
+    TmuxSessionNotFound(String),
+    TmuxCommandFailed(String),
+    DetectionTimeout,
+    TuiError(String),
     Timeout { seconds: u64 },
     QueueEmpty,
     CircuitBreakerOpen { consecutive_failures: u32 },
@@ -25,6 +29,10 @@ impl fmt::Display for VarreError {
             }
             Self::ClaudeNotFound => write!(f, "claude CLI not found in PATH"),
             Self::TmuxNotFound => write!(f, "tmux not found in PATH"),
+            Self::TmuxSessionNotFound(name) => write!(f, "tmux session not found: {name}"),
+            Self::TmuxCommandFailed(msg) => write!(f, "tmux command failed: {msg}"),
+            Self::DetectionTimeout => write!(f, "status detection timed out"),
+            Self::TuiError(msg) => write!(f, "TUI error: {msg}"),
             Self::Timeout { seconds } => write!(f, "operation timed out after {seconds}s"),
             Self::QueueEmpty => write!(f, "queue is empty"),
             Self::CircuitBreakerOpen { consecutive_failures } => {

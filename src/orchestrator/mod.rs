@@ -11,7 +11,9 @@ use crate::backend::{ClaudeBackend, ClaudeResponse, ExecOptions, OutputFormat};
 use crate::config::Config;
 use crate::error::VarreError;
 use crate::session::state::{SessionEvent, SessionState};
-use crate::session::{HeadlessSession, SessionId, SessionKind, SessionStore};
+use crate::session::{HeadlessSession, InteractiveSession, SessionId, SessionKind, SessionStore};
+use crate::tmux::detection::ClaudeStatus;
+use crate::tmux::TmuxWrapper;
 
 /// Maximum consecutive failures before the circuit breaker opens.
 const CIRCUIT_BREAKER_THRESHOLD: u32 = 3;
@@ -74,6 +76,82 @@ impl<B: ClaudeBackend> Orchestrator<B> {
         })
     }
 
+    /// Create a new interactive (tmux) session with the given name and optional working directory.
+    pub async fn create_interactive_session(
+        &mut self,
+        name: &str,
+        working_dir: Option<PathBuf>,
+    ) -> Result<SessionId> {
+        validate_session_name(name)?;
+
+        if self.names.contains_key(name) {
+            bail!("session with name '{}' already exists", name);
+        }
+
+        let tmux = Arc::new(TmuxWrapper::new(&self.config.tmux));
+
+        // Check tmux is available
+        tmux.check_available().await?;
+
+        let dir = working_dir.unwrap_or_else(|| {
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+        });
+
+        // Create tmux session (200x50 for Ink rendering)
+        tmux.create_session(name, (200, 50)).await?;
+
+        let session = InteractiveSession::new(dir, self.config.claude.clone(), tmux.clone());
+        let id = session.id.clone();
+
+        // Start Claude Code in the tmux session
+        tmux.start_claude(name).await?;
+
+        // Transition Creating -> Ready
+        session
+            .send_event(&SessionEvent::Spawned, MAX_RETRIES)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        self.names.insert(name.to_string(), id.clone());
+        self.sessions
+            .add(id.clone(), SessionKind::Interactive(session));
+        self.sessions.save()?;
+        save_names(&Config::data_dir(), &self.names)?;
+
+        tracing::info!(session_name = name, session_id = %id, "interactive session created");
+        Ok(id)
+    }
+
+    /// Capture output from an interactive session.
+    pub async fn capture_output(&self, name: &str, lines: i32) -> Result<String> {
+        let id = self
+            .names
+            .get(name)
+            .ok_or_else(|| VarreError::SessionNotFound(name.to_string()))?;
+
+        match self.sessions.get(id) {
+            Some(SessionKind::Interactive(session)) => session.capture(name, lines).await,
+            Some(SessionKind::Headless(_)) => {
+                bail!("capture is only available for interactive (tmux) sessions")
+            }
+            None => Err(VarreError::SessionNotFound(name.to_string()).into()),
+        }
+    }
+
+    /// Get the Claude Code status for an interactive session.
+    pub async fn session_status(&self, name: &str) -> Result<ClaudeStatus> {
+        let id = self
+            .names
+            .get(name)
+            .ok_or_else(|| VarreError::SessionNotFound(name.to_string()))?;
+
+        match self.sessions.get(id) {
+            Some(SessionKind::Interactive(session)) => Ok(session.status().await),
+            Some(SessionKind::Headless(_)) => Ok(ClaudeStatus::Unknown),
+            None => Err(VarreError::SessionNotFound(name.to_string()).into()),
+        }
+    }
+
     /// Create a new headless session with the given name and optional working directory.
     pub async fn create_session(
         &mut self,
@@ -133,9 +211,38 @@ impl<B: ClaudeBackend> Orchestrator<B> {
             .ok_or_else(|| VarreError::SessionNotFound(name.to_string()))?
             .clone();
 
+        // Handle interactive sessions separately
+        if let Some(SessionKind::Interactive(session)) = self.sessions.get(&id) {
+            let state = session.state().await;
+            match &state {
+                SessionState::Ready => {}
+                SessionState::Busy { .. } => {
+                    return Err(VarreError::SessionBusy(name.to_string()).into());
+                }
+                _ => {
+                    return Err(VarreError::SessionBusy(name.to_string()).into());
+                }
+            }
+            session
+                .send_event(&SessionEvent::PromptSent, MAX_RETRIES)
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            session.send(name, prompt).await?;
+            // Return a synthetic response for interactive sessions
+            return Ok(ClaudeResponse {
+                result: "prompt sent to interactive session".to_string(),
+                session_id: session.id.0.clone(),
+                cost_usd: None,
+                duration_ms: None,
+                stderr: None,
+                truncated: false,
+                model: None,
+            });
+        }
+
         let session = match self.sessions.get(&id) {
             Some(SessionKind::Headless(s)) => s,
-            None => return Err(VarreError::SessionNotFound(name.to_string()).into()),
+            _ => return Err(VarreError::SessionNotFound(name.to_string()).into()),
         };
 
         // Verify the session can accept a prompt.
@@ -173,7 +280,7 @@ impl<B: ClaudeBackend> Orchestrator<B> {
                 // Transition back to Ready.
                 let session = match self.sessions.get(&id) {
                     Some(SessionKind::Headless(s)) => s,
-                    None => return Err(VarreError::SessionNotFound(name.to_string()).into()),
+                    _ => return Err(VarreError::SessionNotFound(name.to_string()).into()),
                 };
                 if let Err(e) = session
                     .send_event(&SessionEvent::Completed, MAX_RETRIES)
@@ -189,7 +296,7 @@ impl<B: ClaudeBackend> Orchestrator<B> {
                 // Transition to Error.
                 let session = match self.sessions.get(&id) {
                     Some(SessionKind::Headless(s)) => s,
-                    None => return Err(VarreError::SessionNotFound(name.to_string()).into()),
+                    _ => return Err(VarreError::SessionNotFound(name.to_string()).into()),
                 };
                 if let Err(te) = session
                     .send_event(
@@ -212,15 +319,28 @@ impl<B: ClaudeBackend> Orchestrator<B> {
         let mut infos = Vec::new();
 
         for (name, id) in &self.names {
-            if let Some(SessionKind::Headless(session)) = self.sessions.get(id) {
-                let state = session.state().await;
-                infos.push(SessionInfo {
-                    id: id.clone(),
-                    name: name.clone(),
-                    state,
-                    created_at: session.created_at,
-                    working_dir: session.working_dir.clone(),
-                });
+            match self.sessions.get(id) {
+                Some(SessionKind::Headless(session)) => {
+                    let state = session.state().await;
+                    infos.push(SessionInfo {
+                        id: id.clone(),
+                        name: name.clone(),
+                        state,
+                        created_at: session.created_at,
+                        working_dir: session.working_dir.clone(),
+                    });
+                }
+                Some(SessionKind::Interactive(session)) => {
+                    let state = session.state().await;
+                    infos.push(SessionInfo {
+                        id: id.clone(),
+                        name: name.clone(),
+                        state,
+                        created_at: session.created_at,
+                        working_dir: session.working_dir.clone(),
+                    });
+                }
+                None => {}
             }
         }
 
@@ -235,11 +355,23 @@ impl<B: ClaudeBackend> Orchestrator<B> {
             .ok_or_else(|| VarreError::SessionNotFound(name.to_string()))?
             .clone();
 
-        if let Some(SessionKind::Headless(session)) = self.sessions.get(&id) {
-            session
-                .send_event(&SessionEvent::Killed, MAX_RETRIES)
-                .await
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
+        match self.sessions.get(&id) {
+            Some(SessionKind::Headless(session)) => {
+                session
+                    .send_event(&SessionEvent::Killed, MAX_RETRIES)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+            }
+            Some(SessionKind::Interactive(session)) => {
+                session
+                    .send_event(&SessionEvent::Killed, MAX_RETRIES)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                // Kill the tmux session
+                let tmux = TmuxWrapper::new(&self.config.tmux);
+                let _ = tmux.kill_session(name).await;
+            }
+            None => {}
         }
 
         self.sessions.remove(&id);

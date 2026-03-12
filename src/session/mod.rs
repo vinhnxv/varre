@@ -1,4 +1,5 @@
 pub mod event;
+pub mod interactive;
 pub mod state;
 
 use std::collections::HashMap;
@@ -13,6 +14,8 @@ use uuid::Uuid;
 use crate::config::ClaudeConfig;
 use crate::error::VarreError;
 use crate::session::state::{SessionEvent, SessionState};
+
+pub use interactive::InteractiveSession;
 
 /// Unique identifier for a session.
 #[derive(Debug, Clone, Hash, Eq, PartialEq, Serialize, Deserialize)]
@@ -47,12 +50,13 @@ impl std::fmt::Display for SessionId {
     }
 }
 
-/// The kind of session — currently only headless is supported.
+/// The kind of session.
 #[derive(Debug)]
 pub enum SessionKind {
     /// A headless (non-interactive) Claude Code session.
     Headless(HeadlessSession),
-    // Interactive added in v0.2
+    /// An interactive Claude Code session running in tmux.
+    Interactive(InteractiveSession),
 }
 
 /// A headless Claude Code session managed by varre.
@@ -125,6 +129,7 @@ struct HeadlessSessionData {
 #[derive(Debug, Serialize, Deserialize)]
 enum SessionKindData {
     Headless(HeadlessSessionData),
+    Interactive(interactive::InteractiveSessionData),
 }
 
 impl From<&HeadlessSession> for HeadlessSessionData {
@@ -178,12 +183,17 @@ impl SessionStore {
 
             let sessions = data
                 .into_iter()
-                .map(|(key, kind_data)| {
+                .filter_map(|(key, kind_data)| {
                     let id = SessionId::from_string(key);
                     let kind = match kind_data {
                         SessionKindData::Headless(d) => SessionKind::Headless(d.into()),
+                        SessionKindData::Interactive(_d) => {
+                            // Interactive sessions need a TmuxWrapper to reconstruct;
+                            // skip them on load (they'll be detected via orphan scan).
+                            return None;
+                        }
                     };
-                    (id, kind)
+                    Some((id, kind))
                 })
                 .collect();
 
@@ -204,11 +214,16 @@ impl SessionStore {
         let data: HashMap<String, SessionKindData> = self
             .sessions
             .iter()
-            .map(|(id, kind)| {
+            .filter_map(|(id, kind)| {
                 let kind_data = match kind {
                     SessionKind::Headless(s) => SessionKindData::Headless(s.into()),
+                    SessionKind::Interactive(_s) => {
+                        // Interactive sessions are ephemeral — not persisted
+                        // They're reconstructed from tmux on startup
+                        return None;
+                    }
                 };
-                (id.0.clone(), kind_data)
+                Some((id.0.clone(), kind_data))
             })
             .collect();
 

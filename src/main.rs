@@ -5,6 +5,8 @@ mod error;
 mod orchestrator;
 mod queue;
 mod session;
+mod tmux;
+mod tui;
 
 use std::sync::Arc;
 
@@ -32,11 +34,24 @@ async fn main() -> Result<()> {
     install_signal_handler(cancel_token.clone());
 
     match cli.command {
-        Commands::New { name, mode: _, dir } => {
+        Commands::New { name, mode, dir } => {
             let backend = Arc::new(CliBackend::new());
             let mut orch = Orchestrator::new(config, backend, cancel_token)?;
-            let id = orch.create_session(&name, dir).await?;
-            println!("created session '{name}' (id: {id})");
+            match mode.as_str() {
+                "headless" => {
+                    let id = orch.create_session(&name, dir).await?;
+                    println!("created headless session '{name}' (id: {id})");
+                }
+                "interactive" | "tmux" => {
+                    let id = orch.create_interactive_session(&name, dir).await?;
+                    println!("created interactive session '{name}' (id: {id})");
+                }
+                other => {
+                    anyhow::bail!(
+                        "unknown mode '{other}', expected 'headless' or 'interactive'"
+                    );
+                }
+            }
         }
 
         Commands::Send {
@@ -168,12 +183,17 @@ async fn main() -> Result<()> {
             }
         },
 
-        Commands::Capture { name: _, lines: _ } => {
-            eprintln!("capture is not yet implemented (planned for v0.2 — tmux only)");
+        Commands::Capture { name, lines } => {
+            let backend = Arc::new(CliBackend::new());
+            let orch = Orchestrator::new(config, backend, cancel_token)?;
+            let output = orch.capture_output(&name, lines.unwrap_or(50)).await?;
+            println!("{output}");
         }
 
         Commands::Tui => {
-            eprintln!("TUI is not yet implemented (planned for v0.2)");
+            let backend = Arc::new(CliBackend::new());
+            let mut orch = Orchestrator::new(config.clone(), backend, cancel_token.clone())?;
+            tui::run(config, &mut orch, cancel_token).await?;
         }
     }
 
