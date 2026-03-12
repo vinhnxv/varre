@@ -228,6 +228,14 @@ impl<B: ClaudeBackend> Orchestrator<B> {
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             session.send(name, prompt).await?;
+            // Transition back to Ready immediately — tmux send-keys is fire-and-forget,
+            // the polling task will detect the actual Claude status separately.
+            if let Err(e) = session
+                .send_event(&SessionEvent::Completed, MAX_RETRIES)
+                .await
+            {
+                tracing::error!(session = name, error = %e, "failed to transition interactive session back to Ready");
+            }
             // Return a synthetic response for interactive sessions
             return Ok(ClaudeResponse {
                 result: "prompt sent to interactive session".to_string(),

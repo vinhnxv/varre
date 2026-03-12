@@ -149,9 +149,9 @@ impl TmuxWrapper {
             return Err(VarreError::TmuxSessionNotFound(name.to_string()).into());
         }
 
-        // Step 1: Send the text (no Enter)
+        // Step 1: Send the text literally (no Enter, -l prevents key name interpretation)
         let output = Command::new("tmux")
-            .args(["send-keys", "-t", &full_name, text])
+            .args(["send-keys", "-t", &full_name, "-l", text])
             .output()
             .await
             .context("failed to send text to tmux")?;

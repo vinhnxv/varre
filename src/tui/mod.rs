@@ -111,18 +111,24 @@ pub async fn run<B: crate::backend::ClaudeBackend + 'static>(
 
         // Poll for crossterm events (non-blocking)
         if ct_event::poll(Duration::from_millis(10))? {
-            if let Event::Key(key) = ct_event::read()? {
-                // Ctrl+C always quits
-                if key.modifiers.contains(KeyModifiers::CONTROL)
-                    && key.code == KeyCode::Char('c')
-                {
-                    app.should_quit = true;
-                } else {
-                    handle_key_event(&mut app, key, orchestrator, &tmux, &mut session_mgr, &config)
+            match ct_event::read()? {
+                Event::Key(key) => {
+                    // Ctrl+C always quits
+                    if key.modifiers.contains(KeyModifiers::CONTROL)
+                        && key.code == KeyCode::Char('c')
+                    {
+                        app.should_quit = true;
+                    } else {
+                        handle_key_event(
+                            &mut app, key, orchestrator, &tmux, &mut session_mgr, &config,
+                        )
                         .await;
+                    }
                 }
-            } else if let Event::Resize(w, h) = ct_event::read().unwrap_or(Event::FocusGained) {
-                app.terminal_size = (w, h);
+                Event::Resize(w, h) => {
+                    app.terminal_size = (w, h);
+                }
+                _ => {}
             }
         }
 
@@ -234,7 +240,7 @@ async fn handle_key_event<B: crate::backend::ClaudeBackend>(
             KeyCode::PageUp => app.scroll_up(10),
             KeyCode::PageDown => app.scroll_down(10),
             KeyCode::Home => {
-                app.scroll_offset = u16::MAX;
+                app.scroll_offset = app.selected_output().len() as u16;
                 app.auto_scroll = false;
             }
             KeyCode::End => {
