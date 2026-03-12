@@ -1,3 +1,6 @@
+use std::collections::HashMap;
+
+use crate::jsonl::JsonlSessionState;
 use crate::tmux::detection::ClaudeStatus;
 use crate::tmux::scanner::{DiscoveredSession, ProcessMetrics};
 
@@ -27,6 +30,8 @@ pub struct SessionViewModel {
     pub pane_size: (u16, u16),
     /// Process metrics (PID, CPU, MEM, started, uptime).
     pub metrics: ProcessMetrics,
+    /// Path to JSONL session log (if discovered).
+    pub jsonl_path: Option<std::path::PathBuf>,
 }
 
 impl SessionViewModel {
@@ -43,6 +48,7 @@ impl SessionViewModel {
             output_lines: session.pane_content.clone(),
             pane_size: session.pane_size,
             metrics: session.metrics.clone(),
+            jsonl_path: session.jsonl_path.clone(),
         }
     }
 
@@ -72,7 +78,7 @@ impl SessionViewModel {
             .unwrap_or_else(|| "TPID:-".into());
         let mcp = format!("MCP:{}", self.metrics.mcp_count);
         let mates = format!("MATES:{}", self.metrics.mate_count);
-        let branch = self.metrics.git_branch
+        let _branch = self.metrics.git_branch
             .as_deref()
             .map(|b| format!("BR:{b}"))
             .unwrap_or_else(|| "BR:-".into());
@@ -98,6 +104,22 @@ impl SessionViewModel {
     }
 }
 
+/// Output view mode — Raw (tmux capture) or JSONL (structured log).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewMode {
+    Raw = 0,
+    Jsonl = 1,
+}
+
+impl ViewMode {
+    pub fn toggle(&self) -> Self {
+        match self {
+            ViewMode::Raw => ViewMode::Jsonl,
+            ViewMode::Jsonl => ViewMode::Raw,
+        }
+    }
+}
+
 /// The main TUI application state.
 pub struct App {
     /// All sessions displayed in the sidebar.
@@ -108,9 +130,9 @@ pub struct App {
     pub input_buffer: String,
     /// Current input mode.
     pub input_mode: InputMode,
-    /// Scroll offset for the output panel.
+    /// Scroll offset for the Raw output panel.
     pub scroll_offset: u16,
-    /// Whether auto-scroll is enabled.
+    /// Whether auto-scroll is enabled for Raw view.
     pub auto_scroll: bool,
     /// Whether the app should exit.
     pub should_quit: bool,
@@ -118,6 +140,14 @@ pub struct App {
     pub status_message: Option<String>,
     /// Terminal size.
     pub terminal_size: (u16, u16),
+    /// Current view mode (Raw or JSONL) — global, not per-session.
+    pub view_mode: ViewMode,
+    /// JSONL state per session, keyed by pane_id. Survives ViewModel rebuilds.
+    pub jsonl_states: HashMap<String, JsonlSessionState>,
+    /// Whether to show thinking blocks in JSONL view.
+    pub show_thinking: bool,
+    /// Whether to show system/progress entries in JSONL view.
+    pub show_system: bool,
 }
 
 impl App {
@@ -133,6 +163,10 @@ impl App {
             should_quit: false,
             status_message: None,
             terminal_size: (80, 24),
+            view_mode: ViewMode::Raw,
+            jsonl_states: HashMap::new(),
+            show_thinking: false,
+            show_system: false,
         }
     }
 
@@ -163,6 +197,15 @@ impl App {
         } else {
             self.clamp_selection();
         }
+
+        // Clean up JSONL states for sessions that no longer exist.
+        let active_panes: std::collections::HashSet<&str> = self
+            .sessions
+            .iter()
+            .map(|s| s.pane_id.as_str())
+            .collect();
+        self.jsonl_states
+            .retain(|pane_id, _| active_panes.contains(pane_id.as_str()));
     }
 
     /// Clamp selected_index to valid range.
@@ -204,17 +247,43 @@ impl App {
             .unwrap_or(&[])
     }
 
-    /// Scroll output up.
+    /// Scroll output up (dispatches to active mode's offset).
     pub fn scroll_up(&mut self, amount: u16) {
-        self.scroll_offset = self.scroll_offset.saturating_add(amount);
-        self.auto_scroll = false;
+        match self.view_mode {
+            ViewMode::Raw => {
+                self.scroll_offset = self.scroll_offset.saturating_add(amount);
+                self.auto_scroll = false;
+            }
+            ViewMode::Jsonl => {
+                if let Some(pane_id) = self.selected_session().map(|s| s.pane_id.clone()) {
+                    if let Some(state) = self.jsonl_states.get_mut(&pane_id) {
+                        state.scroll_offset = state.scroll_offset.saturating_add(amount);
+                        state.auto_scroll = false;
+                    }
+                }
+            }
+        }
     }
 
-    /// Scroll output down.
+    /// Scroll output down (dispatches to active mode's offset).
     pub fn scroll_down(&mut self, amount: u16) {
-        self.scroll_offset = self.scroll_offset.saturating_sub(amount);
-        if self.scroll_offset == 0 {
-            self.auto_scroll = true;
+        match self.view_mode {
+            ViewMode::Raw => {
+                self.scroll_offset = self.scroll_offset.saturating_sub(amount);
+                if self.scroll_offset == 0 {
+                    self.auto_scroll = true;
+                }
+            }
+            ViewMode::Jsonl => {
+                if let Some(pane_id) = self.selected_session().map(|s| s.pane_id.clone()) {
+                    if let Some(state) = self.jsonl_states.get_mut(&pane_id) {
+                        state.scroll_offset = state.scroll_offset.saturating_sub(amount);
+                        if state.scroll_offset == 0 {
+                            state.auto_scroll = true;
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -238,6 +307,7 @@ mod tests {
             pane_content: vec!["output".to_string()],
             pane_size: (200, 50),
             metrics: ProcessMetrics::default(),
+            jsonl_path: None,
         }
     }
 
@@ -311,6 +381,7 @@ mod tests {
             pane_content: vec![],
             pane_size: (200, 50),
             metrics: ProcessMetrics::default(),
+            jsonl_path: None,
         };
         let vm = SessionViewModel::from_discovered(&discovered);
         assert_eq!(vm.status_icon(), "\u{25cf}"); // filled circle

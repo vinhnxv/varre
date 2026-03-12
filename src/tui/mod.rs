@@ -21,7 +21,7 @@ use crate::monitor::MonitorTask;
 use crate::tmux::scanner::TmuxScanner;
 use crate::tmux::TmuxWrapper;
 
-use app::{App, InputMode};
+use app::{App, InputMode, ViewMode};
 use event::AppEvent;
 
 /// Run the TUI application with auto-discovery of Claude Code sessions.
@@ -121,6 +121,42 @@ pub async fn run(config: Config, cancel_token: CancellationToken) -> Result<()> 
         while let Ok(evt) = event_rx.try_recv() {
             match evt {
                 AppEvent::SessionsRefreshed(sessions) => {
+                    // Before updating sessions, do incremental JSONL reads.
+                    for session in &sessions {
+                        if let Some(ref jsonl_path) = session.jsonl_path {
+                            let pane_id = session.pane_id.clone();
+                            let jstate = app
+                                .jsonl_states
+                                .entry(pane_id)
+                                .or_default();
+
+                            // Initialize tailer if needed or path changed.
+                            let needs_init = jstate.tailer.is_none()
+                                || jstate.path.as_ref() != Some(jsonl_path);
+
+                            if needs_init {
+                                jstate.path = Some(jsonl_path.clone());
+                                if let Some(mut tailer) = crate::jsonl::JsonlTailer::new(jsonl_path.clone()) {
+                                    let (entries, errors) = tailer.read_all();
+                                    jstate.stats = crate::jsonl::JsonlStats::default();
+                                    jstate.stats.update_from_entries(&entries);
+                                    jstate.stats.parse_errors = errors;
+                                    jstate.entries = entries;
+                                    if jstate.entries.is_empty() {
+                                        jstate.state = crate::jsonl::JsonlViewState::Empty;
+                                    } else {
+                                        jstate.state = crate::jsonl::JsonlViewState::Ready;
+                                    }
+                                    jstate.tailer = Some(tailer);
+                                }
+                            } else if let Some(ref mut tailer) = jstate.tailer {
+                                let (new_entries, errors) = tailer.read_new();
+                                if !new_entries.is_empty() || errors > 0 {
+                                    jstate.append_entries(new_entries, errors);
+                                }
+                            }
+                        }
+                    }
                     app.update_sessions(sessions);
                 }
                 AppEvent::Resize(w, h) => {
@@ -167,8 +203,8 @@ pub async fn run(config: Config, cancel_token: CancellationToken) -> Result<()> 
 async fn handle_key_event(
     app: &mut App,
     key: crossterm::event::KeyEvent,
-    tmux: &TmuxWrapper,
-    config: &Config,
+    _tmux: &TmuxWrapper,
+    _config: &Config,
 ) {
     match app.input_mode {
         InputMode::Normal => match key.code {
@@ -197,6 +233,21 @@ async fn handle_key_event(
                         }
                     }
                 }
+            }
+            KeyCode::Tab => {
+                app.view_mode = app.view_mode.toggle();
+            }
+            KeyCode::Char('1') => {
+                app.view_mode = ViewMode::Raw;
+            }
+            KeyCode::Char('2') => {
+                app.view_mode = ViewMode::Jsonl;
+            }
+            KeyCode::Char('t') if app.view_mode == ViewMode::Jsonl => {
+                app.show_thinking = !app.show_thinking;
+            }
+            KeyCode::Char('s') if app.view_mode == ViewMode::Jsonl => {
+                app.show_system = !app.show_system;
             }
             KeyCode::Char('r') => {
                 app.status_message = Some("Refresh scheduled (next scan cycle)".to_string());
@@ -291,10 +342,22 @@ async fn send_prompt_to_pane(pane_id: &str, prompt: &str) -> Result<()> {
 /// Spawn a new detached tmux session running Claude Code.
 /// Returns the session name. The monitor task will auto-discover it.
 async fn spawn_claude_session(config: &Config) -> Result<String> {
-    use std::sync::atomic::{AtomicU32, Ordering};
-    static COUNTER: AtomicU32 = AtomicU32::new(1);
-
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    // Find next available session number by checking existing tmux sessions.
+    let existing = tokio::process::Command::new("tmux")
+        .args(["list-sessions", "-F", "#{session_name}"])
+        .output()
+        .await
+        .ok();
+    let max_n = existing
+        .as_ref()
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|name| name.strip_prefix("varre-agent-"))
+        .filter_map(|s| s.parse::<u32>().ok())
+        .max()
+        .unwrap_or(0);
+    let n = max_n + 1;
     let session_name = format!("varre-agent-{n}");
     let binary = &config.claude.binary;
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
@@ -316,7 +379,7 @@ async fn spawn_claude_session(config: &Config) -> Result<String> {
 
     // Start Claude Code in the session.
     let output = tokio::process::Command::new("tmux")
-        .args(["send-keys", "-t", &session_name, binary, "Enter"])
+        .args(["send-keys", "-t", &session_name, "-l", binary])
         .output()
         .await?;
 
@@ -324,6 +387,12 @@ async fn spawn_claude_session(config: &Config) -> Result<String> {
         let stderr = String::from_utf8_lossy(&output.stderr);
         anyhow::bail!("failed to start claude: {}", stderr.trim());
     }
+
+    // Send Enter separately (not via -l which would send literal "Enter" text)
+    tokio::process::Command::new("tmux")
+        .args(["send-keys", "-t", &session_name, "Enter"])
+        .output()
+        .await?;
 
     Ok(session_name)
 }

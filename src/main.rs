@@ -2,6 +2,7 @@ mod backend;
 mod cli;
 mod config;
 mod error;
+mod jsonl;
 mod monitor;
 mod orchestrator;
 mod queue;
@@ -276,7 +277,7 @@ fn format_state(state: &crate::session::state::SessionState) -> String {
         crate::session::state::SessionState::Creating => "creating".into(),
         crate::session::state::SessionState::Ready => "ready".into(),
         crate::session::state::SessionState::Busy { .. } => "busy".into(),
-        crate::session::state::SessionState::WaitingInput => "waiting".into(),
+        crate::session::state::SessionState::WaitingInput { .. } => "waiting".into(),
         crate::session::state::SessionState::Error { retry_count, .. } => {
             format!("error(r:{retry_count})")
         }

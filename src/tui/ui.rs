@@ -1,29 +1,53 @@
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
 use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
-use super::app::{App, InputMode};
+use crate::jsonl::{self, ContentBlock, JsonlViewState, ParsedEntry};
+
+use super::app::{App, InputMode, ViewMode};
+
+// ---------------------------------------------------------------------------
+// Solarized Dark palette — explicit RGB for terminal-agnostic rendering
+// ---------------------------------------------------------------------------
+mod sol {
+    use ratatui::style::Color;
+
+    // Base tones
+    pub const BASE03: Color = Color::Rgb(0, 43, 54);      // darkest bg
+    pub const BASE02: Color = Color::Rgb(7, 54, 66);      // highlight bg
+    pub const BASE01: Color = Color::Rgb(88, 110, 117);   // comments, secondary
+    pub const BASE00: Color = Color::Rgb(101, 123, 131);  // muted body
+    pub const BASE0: Color = Color::Rgb(131, 148, 150);   // body text
+    pub const BASE1: Color = Color::Rgb(147, 161, 161);   // emphasis
+
+    // Accent colors
+    pub const YELLOW: Color = Color::Rgb(181, 137, 0);
+    pub const ORANGE: Color = Color::Rgb(203, 75, 22);
+    pub const RED: Color = Color::Rgb(220, 50, 47);
+    pub const MAGENTA: Color = Color::Rgb(211, 54, 130);
+    pub const VIOLET: Color = Color::Rgb(108, 113, 196);
+    pub const BLUE: Color = Color::Rgb(38, 139, 210);
+    pub const CYAN: Color = Color::Rgb(42, 161, 152);
+    pub const GREEN: Color = Color::Rgb(133, 153, 0);
+}
 
 /// Render the TUI layout.
 pub fn render(f: &mut Frame, app: &App) {
-    // Show overlay if terminal is too small.
     if app.is_terminal_too_small() {
         let area = f.area();
         let msg = Paragraph::new(format!(
             "Terminal too small ({}x{}). Minimum: 80x24",
             app.terminal_size.0, app.terminal_size.1
         ))
-        .style(Style::default().fg(Color::Red));
+        .style(Style::default().fg(sol::RED));
         f.render_widget(msg, area);
         return;
     }
 
     let area = f.area();
-
-    // Main layout: header + body + session info + prompt + status bar.
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -42,29 +66,27 @@ pub fn render(f: &mut Frame, app: &App) {
     render_status_bar(f, chunks[4], app);
 }
 
-/// Render the header bar.
 fn render_header(f: &mut Frame, area: Rect) {
     let header = Paragraph::new(Line::from(vec![
         Span::styled(
             " varre ",
             Style::default()
-                .fg(Color::White)
-                .bg(Color::DarkGray)
+                .fg(sol::BASE03)
+                .bg(sol::BLUE)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::raw(" — Claude Code Monitor  "),
-        Span::styled("[q]uit", Style::default().fg(Color::DarkGray)),
+        Span::styled(" — Claude Code Monitor  ", Style::default().fg(sol::BASE0)),
+        Span::styled("[q]uit", Style::default().fg(sol::BASE01)),
     ]));
     f.render_widget(header, area);
 }
 
-/// Render the body (sidebar + main panel).
 fn render_body(f: &mut Frame, area: Rect, app: &App) {
     let body_chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Length(22), // sidebar
-            Constraint::Min(40),   // main panel
+            Constraint::Length(22),
+            Constraint::Min(40),
         ])
         .split(area);
 
@@ -72,7 +94,6 @@ fn render_body(f: &mut Frame, area: Rect, app: &App) {
     render_output(f, body_chunks[1], app);
 }
 
-/// Render the session sidebar.
 fn render_sidebar(f: &mut Frame, area: Rect, app: &App) {
     let items: Vec<ListItem> = app
         .sessions
@@ -82,12 +103,11 @@ fn render_sidebar(f: &mut Frame, area: Rect, app: &App) {
             let icon = session.status_icon();
             let style = if i == app.selected_index {
                 Style::default()
-                    .fg(Color::Yellow)
+                    .fg(sol::YELLOW)
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::White)
+                Style::default().fg(sol::BASE0)
             };
-
             ListItem::new(Line::from(vec![
                 Span::raw(format!(" {icon} ")),
                 Span::styled(&session.display_name, style),
@@ -98,24 +118,32 @@ fn render_sidebar(f: &mut Frame, area: Rect, app: &App) {
     let sidebar = List::new(items).block(
         Block::default()
             .borders(Borders::ALL)
-            .title(" Sessions "),
+            .border_style(Style::default().fg(sol::BASE01))
+            .title(Span::styled(" Sessions ", Style::default().fg(sol::BASE1))),
     );
-
     f.render_widget(sidebar, area);
 }
 
-/// Render the output panel for the selected session.
 fn render_output(f: &mut Frame, area: Rect, app: &App) {
+    match app.view_mode {
+        ViewMode::Raw => render_raw_output(f, area, app),
+        ViewMode::Jsonl => render_jsonl_output(f, area, app),
+    }
+}
+
+fn render_raw_output(f: &mut Frame, area: Rect, app: &App) {
     let output = app.selected_output();
+    let mode_tag = match app.view_mode {
+        ViewMode::Raw => "[RAW]",
+        ViewMode::Jsonl => "[JSONL]",
+    };
     let title = app
         .selected_session()
-        .map(|s| format!(" Output — {} ({}) ", s.display_name, s.status_text()))
+        .map(|s| format!(" Output — {} ({}) {mode_tag} ", s.display_name, s.status_text()))
         .unwrap_or_else(|| " Output ".to_string());
 
     let total_lines = output.len() as u16;
-    let visible_height = area.height.saturating_sub(2); // borders
-
-    // Calculate scroll position.
+    let visible_height = area.height.saturating_sub(2);
     let scroll = if app.auto_scroll {
         total_lines.saturating_sub(visible_height)
     } else {
@@ -125,31 +153,547 @@ fn render_output(f: &mut Frame, area: Rect, app: &App) {
     };
 
     let text: Vec<Line> = output.iter().map(|l| Line::raw(l.as_str())).collect();
-
     let output_widget = Paragraph::new(text)
-        .block(Block::default().borders(Borders::ALL).title(title))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(sol::BASE01))
+                .title(Span::styled(title, Style::default().fg(sol::BASE1))),
+        )
         .wrap(Wrap { trim: false })
         .scroll((scroll, 0));
-
     f.render_widget(output_widget, area);
 }
 
-/// Render the session info bar with process metrics.
-fn render_session_info(f: &mut Frame, area: Rect, app: &App) {
-    let info = app
+fn render_jsonl_output(f: &mut Frame, area: Rect, app: &App) {
+    let pane_id = app.selected_session().map(|s| s.pane_id.as_str());
+    let jstate = pane_id.and_then(|pid| app.jsonl_states.get(pid));
+
+    let session_name = app
         .selected_session()
-        .map(|s| s.metrics_line())
+        .map(|s| s.display_name.as_str())
+        .unwrap_or("?");
+    let status_text = app
+        .selected_session()
+        .map(|s| s.status_text())
         .unwrap_or_default();
+
+    let stats_str = jstate
+        .map(|js| {
+            let mut parts = Vec::new();
+            if js.stats.total_input_tokens > 0 || js.stats.total_output_tokens > 0 {
+                parts.push(format!(
+                    "IN:{} OUT:{}",
+                    jsonl::format_tokens(js.stats.total_input_tokens),
+                    jsonl::format_tokens(js.stats.total_output_tokens)
+                ));
+            }
+            if js.stats.total_cost_usd > 0.0 {
+                parts.push(jsonl::format_cost(js.stats.total_cost_usd));
+            }
+            if js.stats.num_turns > 0 {
+                parts.push(format!("{} turns", js.stats.num_turns));
+            }
+            if let Some(ref model) = js.stats.model {
+                let short = model.replace("claude-", "").replace("-20250514", "");
+                parts.push(short);
+            }
+            if !parts.is_empty() {
+                format!(" {} ", parts.join(" \u{2502} "))
+            } else {
+                String::new()
+            }
+        })
+        .unwrap_or_default();
+
+    let title = format!(" Output — {session_name} ({status_text}) [JSONL]{stats_str}");
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(sol::CYAN))
+        .title(Span::styled(title, Style::default().fg(sol::BASE1)));
+
+    let Some(jstate) = jstate else {
+        let msg = Paragraph::new("No JSONL state. Switch to a session with JSONL data.")
+            .style(Style::default().fg(sol::BASE01))
+            .block(block);
+        f.render_widget(msg, area);
+        return;
+    };
+
+    match &jstate.state {
+        JsonlViewState::NotFound => {
+            let msg = Paragraph::new("No JSONL file found. Watching for session logs...")
+                .style(Style::default().fg(sol::BASE01).add_modifier(Modifier::ITALIC))
+                .block(block);
+            f.render_widget(msg, area);
+        }
+        JsonlViewState::Empty => {
+            let msg = Paragraph::new("Session active, no entries yet.")
+                .style(Style::default().fg(sol::BASE01).add_modifier(Modifier::ITALIC))
+                .block(block);
+            f.render_widget(msg, area);
+        }
+        JsonlViewState::Error { message } => {
+            let msg = Paragraph::new(format!("JSONL error: {message}"))
+                .style(Style::default().fg(sol::ORANGE))
+                .block(block);
+            f.render_widget(msg, area);
+        }
+        JsonlViewState::Loading { .. } | JsonlViewState::Ready => {
+            let is_loading = matches!(&jstate.state, JsonlViewState::Loading { .. });
+            let visible_height = area.height.saturating_sub(2) as usize;
+            let content_width = area.width.saturating_sub(2) as usize;
+
+            let mut lines: Vec<Line> = Vec::new();
+            let mut entry_num: usize = 0;
+            let mut cum_in: u64 = 0;
+            let mut cum_out: u64 = 0;
+            let mut cum_cost: f64 = 0.0;
+
+            for entry in &jstate.entries {
+                match entry {
+                    ParsedEntry::Thinking { .. } if !app.show_thinking => continue,
+                    ParsedEntry::System { .. } | ParsedEntry::Progress { .. }
+                        if !app.show_system =>
+                    {
+                        continue;
+                    }
+                    _ => {}
+                }
+
+                if let ParsedEntry::Assistant { usage, .. } = entry {
+                    if let Some(u) = usage {
+                        cum_in += u.input_tokens.unwrap_or(0);
+                        cum_out += u.output_tokens.unwrap_or(0);
+                    }
+                }
+                if let ParsedEntry::Result { cost, .. } = entry {
+                    cum_cost = *cost;
+                }
+
+                entry_num += 1;
+                render_entry_cclv(entry, entry_num, &mut lines, content_width,
+                    cum_in, cum_out, cum_cost);
+            }
+
+            if is_loading {
+                if let JsonlViewState::Loading { count } = &jstate.state {
+                    lines.push(Line::from(Span::styled(
+                        format!("  Loading... ({count} entries)"),
+                        Style::default().fg(sol::BASE01).add_modifier(Modifier::ITALIC),
+                    )));
+                }
+            }
+
+            if jstate.stats.parse_errors > 0 {
+                lines.push(Line::from(Span::styled(
+                    format!("  {} malformed entries skipped", jstate.stats.parse_errors),
+                    Style::default().fg(sol::ORANGE),
+                )));
+            }
+
+            let total_lines = lines.len() as u16;
+            let scroll = if jstate.auto_scroll {
+                total_lines.saturating_sub(visible_height as u16)
+            } else {
+                total_lines
+                    .saturating_sub(visible_height as u16)
+                    .saturating_sub(jstate.scroll_offset)
+            };
+
+            let output_widget = Paragraph::new(lines)
+                .block(block)
+                .wrap(Wrap { trim: false })
+                .scroll((scroll, 0));
+            f.render_widget(output_widget, area);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// cclv-style entry rendering (solarized dark)
+// ---------------------------------------------------------------------------
+
+/// Check if a user message is system boilerplate (e.g. "Caveat: The messages below…").
+fn is_system_boilerplate(text: &str) -> bool {
+    let t = text.trim();
+    t.starts_with("Caveat: The messages below were generated")
+        || t.starts_with("Note: ")
+        || (t.starts_with("The messages below") && t.contains("DO NOT respond"))
+}
+
+/// Manually wrap `text` to `max_width` chars, returning wrapped lines.
+fn wrap_text(text: &str, max_width: usize) -> Vec<String> {
+    if max_width == 0 {
+        return vec![text.to_string()];
+    }
+    let mut result = Vec::new();
+    for logical_line in text.lines() {
+        if logical_line.is_empty() {
+            result.push(String::new());
+            continue;
+        }
+        let mut remaining = logical_line;
+        while !remaining.is_empty() {
+            if remaining.len() <= max_width {
+                result.push(remaining.to_string());
+                break;
+            }
+            // Find a char-boundary-safe cutoff at most max_width bytes.
+            let safe_end = remaining
+                .char_indices()
+                .map(|(i, _)| i)
+                .take_while(|&i| i <= max_width)
+                .last()
+                .unwrap_or(remaining.len());
+            // Prefer breaking at a space within safe_end.
+            let break_at = remaining[..safe_end]
+                .rfind(' ')
+                .map(|pos| pos + 1) // include the space
+                .unwrap_or(safe_end);
+            result.push(remaining[..break_at].to_string());
+            remaining = &remaining[break_at..];
+        }
+    }
+    result
+}
+
+/// Push wrapped body lines with the continuation prefix.
+fn push_body_lines<'a>(
+    lines: &mut Vec<Line<'a>>,
+    text_lines: &[String],
+    style: Style,
+    cont_prefix: &str,
+    idx_style: Style,
+    max_width: usize,
+    collapse_threshold: usize,
+    summary_count: usize,
+) {
+    let mut all_wrapped: Vec<String> = Vec::new();
+    for line in text_lines {
+        if line.is_empty() {
+            all_wrapped.push(String::new());
+        } else {
+            all_wrapped.extend(wrap_text(line, max_width));
+        }
+    }
+
+    let display_lines: &[String];
+    let mut remaining_msg: Option<usize> = None;
+
+    if all_wrapped.len() > collapse_threshold {
+        display_lines = &all_wrapped[..summary_count];
+        remaining_msg = Some(all_wrapped.len() - summary_count);
+    } else {
+        display_lines = &all_wrapped;
+    }
+
+    for line in display_lines {
+        lines.push(Line::from(vec![
+            Span::styled(cont_prefix.to_string(), idx_style),
+            Span::styled(line.clone(), style),
+        ]));
+    }
+
+    if let Some(remaining) = remaining_msg {
+        lines.push(Line::from(vec![
+            Span::styled(cont_prefix.to_string(), idx_style),
+            Span::styled(
+                format!("(+{remaining} more lines)"),
+                Style::default().fg(sol::BASE01),
+            ),
+        ]));
+    }
+}
+
+fn render_entry_cclv<'a>(
+    entry: &ParsedEntry,
+    num: usize,
+    lines: &mut Vec<Line<'a>>,
+    content_width: usize,
+    cum_in: u64,
+    cum_out: u64,
+    cum_cost: f64,
+) {
+    let idx_style = Style::default().fg(sol::BASE01);
+    let idx_prefix = format!("\u{2502}{:>3} ", num);
+    let cont_prefix = "\u{2502}    ";
+    let prefix_width = 5; // "│    " = 5 chars
+    let text_width = content_width.saturating_sub(prefix_width + 1);
+
+    match entry {
+        ParsedEntry::User { text, .. } => {
+            // Show token divider only when there are actual tokens.
+            if num > 1 && (cum_in > 0 || cum_out > 0) {
+                render_token_divider(lines, content_width, cum_in, cum_out, cum_cost);
+            }
+            lines.push(Line::from(vec![
+                Span::styled(idx_prefix.clone(), idx_style),
+                Span::styled(
+                    "\u{25b6} User",
+                    Style::default().fg(sol::CYAN).add_modifier(Modifier::BOLD),
+                ),
+            ]));
+            let cleaned = strip_xml_tags(text);
+            let cleaned = cleaned.trim();
+            if !cleaned.is_empty() && !is_system_boilerplate(cleaned) {
+                let body: Vec<String> = cleaned
+                    .lines()
+                    .filter(|l| !l.trim().is_empty())
+                    .map(|l| l.trim().to_string())
+                    .collect();
+                push_body_lines(
+                    lines, &body,
+                    Style::default().fg(sol::CYAN),
+                    cont_prefix, idx_style, text_width,
+                    20, 5,
+                );
+            }
+        }
+        ParsedEntry::Assistant { blocks, model, .. } => {
+            let model_tag = model
+                .as_ref()
+                .map(|m| {
+                    let short = m.replace("claude-", "").replace("-20250514", "");
+                    format!(" [{short}]")
+                })
+                .unwrap_or_default();
+            lines.push(Line::from(vec![
+                Span::styled(idx_prefix.clone(), idx_style),
+                Span::styled(
+                    format!("\u{25c0} Assistant{model_tag}"),
+                    Style::default().fg(sol::GREEN).add_modifier(Modifier::BOLD),
+                ),
+            ]));
+            let mut text_lines: Vec<String> = Vec::new();
+            for block in blocks {
+                if let ContentBlock::Text(text) = block {
+                    for line in text.lines() {
+                        text_lines.push(line.to_string());
+                    }
+                }
+            }
+            push_body_lines(
+                lines, &text_lines,
+                Style::default().fg(sol::BASE0),
+                cont_prefix, idx_style, text_width,
+                10, 3,
+            );
+        }
+        ParsedEntry::ToolUse { name, summary, .. } => {
+            lines.push(Line::from(vec![
+                Span::styled(idx_prefix.clone(), idx_style),
+                Span::styled(
+                    format!("\u{1f527} {name}"),
+                    Style::default().fg(sol::YELLOW).add_modifier(Modifier::BOLD),
+                ),
+            ]));
+            if !summary.is_empty() {
+                let sum_lines: Vec<String> = vec![summary.clone()];
+                push_body_lines(
+                    lines, &sum_lines,
+                    Style::default().fg(sol::YELLOW),
+                    cont_prefix, idx_style, text_width,
+                    5, 3,
+                );
+            }
+        }
+        ParsedEntry::ToolResult { content, .. } => {
+            if !content.is_empty() {
+                let result_lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
+                push_body_lines(
+                    lines, &result_lines,
+                    Style::default().fg(sol::BASE01),
+                    cont_prefix, idx_style, text_width,
+                    5, 3,
+                );
+            }
+        }
+        ParsedEntry::Thinking { text, .. } => {
+            lines.push(Line::from(vec![
+                Span::styled(idx_prefix.clone(), idx_style),
+                Span::styled(
+                    "\u{1f4ad} Thinking",
+                    Style::default()
+                        .fg(sol::VIOLET)
+                        .add_modifier(Modifier::ITALIC),
+                ),
+            ]));
+            let think_lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
+            push_body_lines(
+                lines, &think_lines,
+                Style::default().fg(sol::VIOLET).add_modifier(Modifier::ITALIC),
+                cont_prefix, idx_style, text_width,
+                5, 3,
+            );
+        }
+        ParsedEntry::System { subtype, text, .. } => {
+            let display = if text.is_empty() {
+                format!("[system: {subtype}]")
+            } else {
+                format!("[system: {subtype}] {}", truncate_display(text, 80))
+            };
+            lines.push(Line::from(vec![
+                Span::styled(idx_prefix.clone(), idx_style),
+                Span::styled(display, Style::default().fg(sol::BASE01)),
+            ]));
+        }
+        ParsedEntry::Progress { message, .. } => {
+            lines.push(Line::from(vec![
+                Span::styled(idx_prefix.clone(), idx_style),
+                Span::styled(
+                    format!("\u{25cb} {message}"),
+                    Style::default().fg(sol::BASE01),
+                ),
+            ]));
+        }
+        ParsedEntry::Result {
+            cost,
+            duration_ms,
+            turns,
+            ..
+        } => {
+            let dash = "\u{2500}";
+            let divider = dash.repeat(content_width.saturating_sub(2));
+            lines.push(Line::from(Span::styled(
+                divider.clone(),
+                Style::default().fg(sol::GREEN),
+            )));
+            lines.push(Line::from(vec![
+                Span::styled("  ", Style::default()),
+                Span::styled(
+                    format!(
+                        "\u{2714} Session complete: {} | {} turns | {}",
+                        jsonl::format_cost(*cost),
+                        turns,
+                        jsonl::format_duration_ms(*duration_ms)
+                    ),
+                    Style::default()
+                        .fg(sol::GREEN)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]));
+            lines.push(Line::from(Span::styled(
+                divider,
+                Style::default().fg(sol::GREEN),
+            )));
+        }
+    }
+}
+
+/// Token divider between conversation turns.
+fn render_token_divider<'a>(
+    lines: &mut Vec<Line<'a>>,
+    content_width: usize,
+    cum_in: u64,
+    cum_out: u64,
+    cum_cost: f64,
+) {
+    let stats = format!(
+        " \u{2193}{} \u{2191}{} {}",
+        jsonl::format_tokens(cum_in),
+        jsonl::format_tokens(cum_out),
+        if cum_cost > 0.0 {
+            format!("/ {}", jsonl::format_cost(cum_cost))
+        } else {
+            String::new()
+        }
+    );
+    let dash = "\u{2500}";
+    let stats_len = stats.chars().count();
+    let left = 2;
+    let right = content_width.saturating_sub(left + stats_len + 1);
+    let divider = format!("{}{}{}", dash.repeat(left), stats, dash.repeat(right));
+    lines.push(Line::from(Span::styled(
+        divider,
+        Style::default().fg(sol::BASE00),
+    )));
+}
+
+/// Strip XML-like tags from user messages (system-injected content).
+fn strip_xml_tags(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    let mut in_tag = false;
+    let mut chars = text.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch == '<' {
+            // Check if this looks like an XML tag (starts with letter or /)
+            if let Some(&next) = chars.peek() {
+                if next.is_ascii_alphabetic() || next == '/' {
+                    in_tag = true;
+                    continue;
+                }
+            }
+            result.push(ch);
+        } else if ch == '>' && in_tag {
+            in_tag = false;
+        } else if !in_tag {
+            result.push(ch);
+        }
+    }
+    result
+}
+
+fn truncate_display(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let end = s.char_indices().nth(max).map(|(i, _)| i).unwrap_or(s.len());
+        format!("{}...", &s[..end])
+    }
+}
+
+/// Render the session info bar.
+fn render_session_info(f: &mut Frame, area: Rect, app: &App) {
+    let info = match app.view_mode {
+        ViewMode::Raw => app
+            .selected_session()
+            .map(|s| s.metrics_line())
+            .unwrap_or_default(),
+        ViewMode::Jsonl => {
+            if let Some(pane_id) = app.selected_session().map(|s| &s.pane_id) {
+                if let Some(jstate) = app.jsonl_states.get(pane_id) {
+                    let s = &jstate.stats;
+                    let mut parts = Vec::new();
+                    parts.push(format!(
+                        "IN:{}  OUT:{}",
+                        jsonl::format_tokens(s.total_input_tokens),
+                        jsonl::format_tokens(s.total_output_tokens)
+                    ));
+                    if s.total_cache_read > 0 || s.total_cache_creation > 0 {
+                        parts.push(format!(
+                            "CACHE:{}r/{}w",
+                            jsonl::format_tokens(s.total_cache_read),
+                            jsonl::format_tokens(s.total_cache_creation)
+                        ));
+                    }
+                    parts.push(jsonl::format_cost(s.total_cost_usd));
+                    parts.push(format!("{} turns", s.num_turns));
+                    if let Some(ref m) = s.model {
+                        parts.push(m.clone());
+                    }
+                    if s.parse_errors > 0 {
+                        parts.push(format!("{} skipped", s.parse_errors));
+                    }
+                    parts.join("  ")
+                } else {
+                    "No JSONL data".to_string()
+                }
+            } else {
+                String::new()
+            }
+        }
+    };
 
     let bar = Paragraph::new(Line::from(vec![
         Span::styled(" ", Style::default()),
-        Span::styled(info, Style::default().fg(Color::Cyan)),
+        Span::styled(info, Style::default().fg(sol::CYAN)),
     ]));
-
     f.render_widget(bar, area);
 }
 
-/// Render the prompt input / instructions area.
+/// Render the prompt input area.
 fn render_prompt_input(f: &mut Frame, area: Rect, app: &App) {
     let has_sessions = !app.sessions.is_empty();
 
@@ -162,15 +706,15 @@ fn render_prompt_input(f: &mut Frame, area: Rect, app: &App) {
             };
             (
                 " Instructions ",
-                Style::default().fg(Color::DarkGray),
-                Style::default().fg(Color::Gray),
+                Style::default().fg(sol::BASE01),
+                Style::default().fg(sol::BASE01),
                 Some(hint),
             )
         }
         InputMode::Insert => (
             " Prompt (Enter to send, Esc to cancel) ",
-            Style::default().fg(Color::White),
-            Style::default().fg(Color::Yellow),
+            Style::default().fg(sol::BASE0),
+            Style::default().fg(sol::YELLOW),
             None,
         ),
     };
@@ -178,7 +722,7 @@ fn render_prompt_input(f: &mut Frame, area: Rect, app: &App) {
     let content = if app.input_buffer.is_empty() {
         if let Some(msg) = hint {
             Paragraph::new(msg)
-                .style(Style::default().fg(Color::Gray).add_modifier(Modifier::ITALIC))
+                .style(Style::default().fg(sol::BASE01).add_modifier(Modifier::ITALIC))
         } else {
             Paragraph::new("").style(text_style)
         }
@@ -192,10 +736,8 @@ fn render_prompt_input(f: &mut Frame, area: Rect, app: &App) {
             .border_style(border_style)
             .title(title),
     );
-
     f.render_widget(input, area);
 
-    // Show cursor in Insert mode.
     if app.input_mode == InputMode::Insert {
         let x = area.x + 1 + app.input_buffer.width() as u16;
         let y = area.y + 1;
@@ -203,34 +745,47 @@ fn render_prompt_input(f: &mut Frame, area: Rect, app: &App) {
     }
 }
 
-/// Render the status bar at the bottom.
+/// Render the status bar.
 fn render_status_bar(f: &mut Frame, area: Rect, app: &App) {
     let mode_indicator = match app.input_mode {
         InputMode::Normal => Span::styled(
             " NORMAL ",
-            Style::default().fg(Color::Black).bg(Color::Green),
+            Style::default().fg(sol::BASE03).bg(sol::GREEN),
         ),
         InputMode::Insert => Span::styled(
             " INSERT ",
-            Style::default().fg(Color::Black).bg(Color::Yellow),
+            Style::default().fg(sol::BASE03).bg(sol::YELLOW),
         ),
     };
 
-    let session_count = Span::raw(format!(" {} sessions ", app.sessions.len()));
+    let view_mode_indicator = match app.view_mode {
+        ViewMode::Raw => Span::styled(
+            " [RAW] ",
+            Style::default().fg(sol::BASE0).bg(sol::BASE02),
+        ),
+        ViewMode::Jsonl => Span::styled(
+            " [JSONL] ",
+            Style::default().fg(sol::BASE03).bg(sol::CYAN),
+        ),
+    };
+
+    let session_count = Span::styled(
+        format!(" {} sessions ", app.sessions.len()),
+        Style::default().fg(sol::BASE0),
+    );
 
     let status_msg = app
         .status_message
         .as_deref()
-        .unwrap_or("j/k: navigate | i: input | Ctrl+N: new | d: kill | q: quit");
+        .unwrap_or("j/k: navigate | i: input | Tab: mode | q: quit");
 
-    // Branch + CWD of selected session, right-aligned with icons.
     let branch_raw = app
         .selected_session()
         .and_then(|s| s.metrics.git_branch.as_deref())
         .unwrap_or("-");
-    // Truncate long branch names.
-    let branch = if branch_raw.len() > 40 {
-        format!("{}...", &branch_raw[..37])
+    let branch = if branch_raw.chars().count() > 40 {
+        let end = branch_raw.char_indices().nth(37).map(|(i, _)| i).unwrap_or(branch_raw.len());
+        format!("{}...", &branch_raw[..end])
     } else {
         branch_raw.to_string()
     };
@@ -246,38 +801,41 @@ fn render_status_bar(f: &mut Frame, area: Rect, app: &App) {
         .unwrap_or("-");
     let right_display = format!(" \u{2387} {}{} \u{2502} {} ", branch, pr_suffix, cwd);
 
-    // Calculate left side width to pad with spaces for right-alignment.
-    let left_parts = format!(" {} {} sessions  {status_msg}", match app.input_mode {
+    let view_tag = match app.view_mode {
+        ViewMode::Raw => "[RAW]",
+        ViewMode::Jsonl => "[JSONL]",
+    };
+    let left_parts = format!(" {} {} {} sessions  {status_msg}", match app.input_mode {
         InputMode::Normal => "NORMAL",
         InputMode::Insert => "INSERT",
-    }, app.sessions.len());
+    }, view_tag, app.sessions.len());
     let padding = (area.width as usize).saturating_sub(left_parts.len() + right_display.len());
 
     let bar = Paragraph::new(Line::from(vec![
         mode_indicator,
+        view_mode_indicator,
         session_count,
         Span::styled(
             format!(" {status_msg}"),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(sol::BASE01),
         ),
         Span::raw(" ".repeat(padding)),
         Span::styled(
             format!(" \u{2387} {branch}"),
-            Style::default().fg(Color::Green),
+            Style::default().fg(sol::GREEN),
         ),
         Span::styled(
             format!("{pr_suffix} "),
-            Style::default().fg(Color::Yellow),
+            Style::default().fg(sol::YELLOW),
         ),
         Span::styled(
             "\u{2502}",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(sol::BASE01),
         ),
         Span::styled(
             format!(" {cwd} "),
-            Style::default().fg(Color::Cyan),
+            Style::default().fg(sol::BLUE),
         ),
     ]));
-
     f.render_widget(bar, area);
 }

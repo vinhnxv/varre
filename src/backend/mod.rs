@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 pub use cli::CliBackend;
+#[cfg(test)]
 pub use mock::MockBackend;
 
 /// Output format for Claude CLI responses.
@@ -13,7 +14,6 @@ pub use mock::MockBackend;
 pub enum OutputFormat {
     #[default]
     Json,
-    StreamJson,
 }
 
 impl OutputFormat {
@@ -21,7 +21,6 @@ impl OutputFormat {
     pub fn as_str(&self) -> &str {
         match self {
             Self::Json => "json",
-            Self::StreamJson => "stream-json",
         }
     }
 }
@@ -63,7 +62,4 @@ pub struct ClaudeResponse {
 pub trait ClaudeBackend: Send + Sync {
     /// Execute a prompt and return the parsed response.
     async fn execute(&self, prompt: &str, opts: ExecOptions) -> Result<ClaudeResponse>;
-
-    /// Return the Claude CLI version string.
-    async fn version(&self) -> Result<String>;
 }

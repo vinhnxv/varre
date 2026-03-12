@@ -58,14 +58,6 @@ impl InteractiveSession {
         }
     }
 
-    /// Start Claude Code in the tmux session.
-    pub async fn start_claude(&self, session_name: &str) -> Result<()> {
-        self.tmux.start_claude(session_name).await?;
-        // Transition Creating -> Ready
-        self.send_event(&SessionEvent::Spawned, 3).await?;
-        Ok(())
-    }
-
     /// Send a prompt to the tmux session via the Escape+delay+Enter workaround.
     pub async fn send(&self, session_name: &str, prompt: &str) -> Result<()> {
         self.tmux.send_keys(session_name, prompt).await?;
@@ -80,35 +72,6 @@ impl InteractiveSession {
     /// Return the last detected Claude Code status.
     pub async fn status(&self) -> ClaudeStatus {
         self.claude_status.read().await.clone()
-    }
-
-    /// Perform a single poll cycle: capture pane, detect status, update buffers.
-    pub async fn poll_once(&self, session_name: &str) -> Result<ClaudeStatus> {
-        let output = self.tmux.capture_pane(session_name, 50).await?;
-
-        // Update output buffer (VecDeque sliding window)
-        {
-            let mut buf = self.output_buffer.write().await;
-            buf.clear();
-            for line in output.lines() {
-                if buf.len() >= self.max_output_lines {
-                    buf.pop_front();
-                }
-                buf.push_back(line.to_string());
-            }
-        }
-
-        // Detect status
-        let status =
-            crate::tmux::detection::detect_status(&output, self.tmux.prompt_marker());
-
-        // Update status
-        {
-            let mut s = self.claude_status.write().await;
-            *s = status.clone();
-        }
-
-        Ok(status)
     }
 
     /// Read the current lifecycle state.
@@ -126,31 +89,6 @@ impl InteractiveSession {
         let new_state = state.transition(event, max_retries)?;
         *state = new_state.clone();
         Ok(new_state)
-    }
-
-    /// Return the buffered output lines for display.
-    pub async fn output_lines(&self) -> Vec<String> {
-        self.output_buffer.read().await.iter().cloned().collect()
-    }
-
-    /// Return shared references for the polling task.
-    pub fn shared_status(&self) -> Arc<RwLock<ClaudeStatus>> {
-        self.claude_status.clone()
-    }
-
-    /// Return shared output buffer reference.
-    pub fn shared_output(&self) -> Arc<RwLock<VecDeque<String>>> {
-        self.output_buffer.clone()
-    }
-
-    /// Return shared state reference.
-    pub fn shared_state(&self) -> Arc<RwLock<SessionState>> {
-        self.state.clone()
-    }
-
-    /// Return the session ID.
-    pub fn id(&self) -> &SessionId {
-        &self.id
     }
 }
 
@@ -203,9 +141,4 @@ mod tests {
         assert_eq!(session.state().await, SessionState::Ready);
     }
 
-    #[tokio::test]
-    async fn test_output_lines_empty_initially() {
-        let session = make_session();
-        assert!(session.output_lines().await.is_empty());
-    }
 }

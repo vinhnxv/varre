@@ -76,7 +76,4 @@ impl ClaudeBackend for MockBackend {
             .expect("MockBackend has neither response nor error"))
     }
 
-    async fn version(&self) -> Result<String> {
-        Ok("claude-mock 0.0.0".into())
-    }
 }
