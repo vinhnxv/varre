@@ -78,10 +78,13 @@ impl Job {
 }
 
 /// Compute a deterministic hash string from prompt and session target.
+/// Uses null byte delimiter to prevent collision between e.g. "testNone" and "test"+None.
 fn compute_content_hash(prompt: &str, session_target: &Option<SessionId>) -> String {
     let mut hasher = DefaultHasher::new();
-    let input = format!("{}{:?}", prompt, session_target);
-    input.hash(&mut hasher);
+    prompt.hash(&mut hasher);
+    // Null byte delimiter prevents cross-field collisions
+    b'\0'.hash(&mut hasher);
+    session_target.hash(&mut hasher);
     format!("{:016x}", hasher.finish())
 }
 

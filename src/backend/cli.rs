@@ -88,33 +88,59 @@ impl ClaudeBackend for CliBackend {
         let mut cmd = Command::new(&self.binary);
         cmd.args(&args)
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
+            .stderr(Stdio::piped());
 
         if let Some(ref dir) = opts.working_dir {
             cmd.current_dir(dir);
         }
 
-        let child = cmd.spawn().context("failed to spawn claude process")?;
-        let child_pid = child.id();
+        let mut child = cmd.spawn().context("failed to spawn claude process")?;
+
+        // Take stdout/stderr handles before waiting, so we retain access to `child` for kill.
+        let stdout_handle = child.stdout.take();
+        let stderr_handle = child.stderr.take();
 
         let timeout_duration = std::time::Duration::from_secs(timeout_secs);
-        let output = match tokio::time::timeout(timeout_duration, child.wait_with_output()).await {
+        let status = match tokio::time::timeout(timeout_duration, child.wait()).await {
             Ok(result) => result.context("claude process failed")?,
             Err(_) => {
-                // Timeout: try SIGTERM via saved pid, then SIGKILL
+                // Timeout: graceful SIGTERM → grace period → SIGKILL
                 #[cfg(unix)]
-                if let Some(pid) = child_pid {
-                    unsafe {
-                        libc::kill(pid as i32, libc::SIGTERM);
+                {
+                    if let Some(pid) = child.id() {
+                        unsafe {
+                            libc::kill(pid as i32, libc::SIGTERM);
+                        }
+                        tokio::time::sleep(std::time::Duration::from_secs(SIGTERM_GRACE_SECS))
+                            .await;
                     }
-                    // Give it a grace period then force kill
-                    tokio::time::sleep(std::time::Duration::from_secs(SIGTERM_GRACE_SECS)).await;
-                    let _ = unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+                    let _ = child.kill().await;
+                }
+
+                #[cfg(not(unix))]
+                {
+                    let _ = child.kill().await;
                 }
 
                 bail!("claude process timed out after {timeout_secs}s");
             }
+        };
+
+        // Read captured stdout and stderr.
+        use tokio::io::AsyncReadExt;
+        let mut stdout_bytes_vec = Vec::new();
+        if let Some(mut stdout) = stdout_handle {
+            stdout.read_to_end(&mut stdout_bytes_vec).await.context("failed to read stdout")?;
+        }
+        let mut stderr_bytes_vec = Vec::new();
+        if let Some(mut stderr) = stderr_handle {
+            stderr.read_to_end(&mut stderr_bytes_vec).await.context("failed to read stderr")?;
+        }
+
+        let output = std::process::Output {
+            status: status,
+            stdout: stdout_bytes_vec,
+            stderr: stderr_bytes_vec,
         };
 
         let stderr_text = String::from_utf8_lossy(&output.stderr);
@@ -162,6 +188,14 @@ impl ClaudeBackend for CliBackend {
             .output()
             .await
             .context("failed to run claude --version")?;
+
+        if !output.status.success() {
+            bail!(
+                "claude --version exited with status {}: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
 
         let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
         Ok(version)

@@ -85,8 +85,10 @@ impl PromptQueue {
         }
     }
 
-    /// Persist the queue to disk atomically (write to .tmp, then rename).
+    /// Persist the queue to disk atomically (write to .tmp → fsync → rename).
     pub fn save(&self) -> Result<()> {
+        use std::io::Write;
+
         let data = QueueData {
             jobs: self.jobs.clone(),
             completed: self.completed.clone(),
@@ -103,8 +105,12 @@ impl PromptQueue {
                 .context("failed to create queue directory")?;
         }
 
-        std::fs::write(&tmp_path, json.as_bytes())
+        let mut file = std::fs::File::create(&tmp_path)
+            .context("failed to create temp queue file")?;
+        file.write_all(json.as_bytes())
             .context("failed to write temp queue file")?;
+        file.sync_all()
+            .context("failed to fsync queue file")?;
         std::fs::rename(&tmp_path, &self.data_path)
             .context("failed to rename queue file")?;
 

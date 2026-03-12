@@ -10,7 +10,8 @@ pub enum SessionState {
     /// Session is idle and ready to accept prompts.
     Ready,
     /// Session is actively processing a prompt.
-    Busy,
+    /// Carries retry context from Error state for proper accumulation.
+    Busy { retry_count: u32 },
     /// Session is waiting for user input (permission prompt).
     WaitingInput,
     /// Session encountered an error and may be retried.
@@ -67,27 +68,37 @@ impl SessionState {
             (SessionState::Creating, SessionEvent::Killed) => Ok(SessionState::Dead),
 
             // Ready transitions
-            (SessionState::Ready, SessionEvent::PromptSent) => Ok(SessionState::Busy),
+            (SessionState::Ready, SessionEvent::PromptSent) => {
+                Ok(SessionState::Busy { retry_count: 0 })
+            }
             (SessionState::Ready, SessionEvent::Killed) => Ok(SessionState::Dead),
 
-            // Busy transitions
-            (SessionState::Busy, SessionEvent::Completed) => Ok(SessionState::Ready),
-            (SessionState::Busy, SessionEvent::Failed(msg)) => Ok(SessionState::Error {
-                retry_count: 1,
-                last_error: msg.clone(),
-            }),
-            (SessionState::Busy, SessionEvent::PermissionPrompt) => {
+            // Busy transitions — retry_count is carried through
+            (SessionState::Busy { retry_count }, SessionEvent::Completed) => {
+                let _ = retry_count; // consumed
+                Ok(SessionState::Ready)
+            }
+            (SessionState::Busy { retry_count }, SessionEvent::Failed(msg)) => {
+                Ok(SessionState::Error {
+                    retry_count: retry_count + 1,
+                    last_error: msg.clone(),
+                })
+            }
+            (SessionState::Busy { retry_count }, SessionEvent::PermissionPrompt) => {
+                let _ = retry_count;
                 Ok(SessionState::WaitingInput)
             }
-            (SessionState::Busy, SessionEvent::Timeout) => Ok(SessionState::Error {
-                retry_count: 0,
-                last_error: "timeout".to_string(),
-            }),
-            (SessionState::Busy, SessionEvent::Killed) => Ok(SessionState::Dead),
+            (SessionState::Busy { retry_count }, SessionEvent::Timeout) => {
+                Ok(SessionState::Error {
+                    retry_count: retry_count + 1,
+                    last_error: "timeout".to_string(),
+                })
+            }
+            (SessionState::Busy { .. }, SessionEvent::Killed) => Ok(SessionState::Dead),
 
             // WaitingInput transitions
             (SessionState::WaitingInput, SessionEvent::PermissionResolved) => {
-                Ok(SessionState::Busy)
+                Ok(SessionState::Busy { retry_count: 0 })
             }
             (SessionState::WaitingInput, SessionEvent::Timeout) => Ok(SessionState::Error {
                 retry_count: 0,
@@ -104,7 +115,9 @@ impl SessionState {
                 SessionEvent::PromptSent,
             ) => {
                 if *retry_count < max_retries {
-                    Ok(SessionState::Busy)
+                    Ok(SessionState::Busy {
+                        retry_count: *retry_count,
+                    })
                 } else {
                     Err(VarreError::InvalidTransition {
                         from: format!("{:?}", self),
@@ -161,19 +174,19 @@ mod tests {
     fn test_ready_prompt_sent_becomes_busy() {
         let state = SessionState::Ready;
         let result = state.transition(&SessionEvent::PromptSent, 3).unwrap();
-        assert_eq!(result, SessionState::Busy);
+        assert_eq!(result, SessionState::Busy { retry_count: 0 });
     }
 
     #[test]
     fn test_busy_completed_becomes_ready() {
-        let state = SessionState::Busy;
+        let state = SessionState::Busy { retry_count: 0 };
         let result = state.transition(&SessionEvent::Completed, 3).unwrap();
         assert_eq!(result, SessionState::Ready);
     }
 
     #[test]
     fn test_busy_failed_becomes_error_with_retry_1() {
-        let state = SessionState::Busy;
+        let state = SessionState::Busy { retry_count: 0 };
         let result = state
             .transition(&SessionEvent::Failed("oops".into()), 3)
             .unwrap();
@@ -187,8 +200,29 @@ mod tests {
     }
 
     #[test]
+    fn test_retry_count_accumulates_across_cycles() {
+        // Error{1} → PromptSent → Busy{1} → Failed → Error{2}
+        let state = SessionState::Error {
+            retry_count: 1,
+            last_error: "first".into(),
+        };
+        let busy = state.transition(&SessionEvent::PromptSent, 3).unwrap();
+        assert_eq!(busy, SessionState::Busy { retry_count: 1 });
+        let error = busy
+            .transition(&SessionEvent::Failed("second".into()), 3)
+            .unwrap();
+        assert_eq!(
+            error,
+            SessionState::Error {
+                retry_count: 2,
+                last_error: "second".into()
+            }
+        );
+    }
+
+    #[test]
     fn test_busy_permission_prompt_becomes_waiting() {
-        let state = SessionState::Busy;
+        let state = SessionState::Busy { retry_count: 0 };
         let result = state
             .transition(&SessionEvent::PermissionPrompt, 3)
             .unwrap();
@@ -201,7 +235,7 @@ mod tests {
         let result = state
             .transition(&SessionEvent::PermissionResolved, 3)
             .unwrap();
-        assert_eq!(result, SessionState::Busy);
+        assert_eq!(result, SessionState::Busy { retry_count: 0 });
     }
 
     #[test]
@@ -211,7 +245,7 @@ mod tests {
             last_error: "oops".into(),
         };
         let result = state.transition(&SessionEvent::PromptSent, 3).unwrap();
-        assert_eq!(result, SessionState::Busy);
+        assert_eq!(result, SessionState::Busy { retry_count: 1 });
     }
 
     #[test]

@@ -80,6 +80,8 @@ impl<B: ClaudeBackend> Orchestrator<B> {
         name: &str,
         working_dir: Option<PathBuf>,
     ) -> Result<SessionId> {
+        validate_session_name(name)?;
+
         if self.names.contains_key(name) {
             bail!("session with name '{}' already exists", name);
         }
@@ -113,6 +115,10 @@ impl<B: ClaudeBackend> Orchestrator<B> {
         name: &str,
         prompt: &str,
     ) -> Result<ClaudeResponse> {
+        if prompt.trim().is_empty() {
+            bail!("prompt cannot be empty");
+        }
+
         let failures = self.consecutive_failures.load(Ordering::Relaxed);
         if failures >= CIRCUIT_BREAKER_THRESHOLD {
             return Err(VarreError::CircuitBreakerOpen {
@@ -137,7 +143,7 @@ impl<B: ClaudeBackend> Orchestrator<B> {
         match &state {
             SessionState::Ready => {}
             SessionState::Error { retry_count, .. } if *retry_count < MAX_RETRIES => {}
-            SessionState::Busy => {
+            SessionState::Busy { .. } => {
                 return Err(VarreError::SessionBusy(name.to_string()).into());
             }
             _ => {
@@ -169,9 +175,12 @@ impl<B: ClaudeBackend> Orchestrator<B> {
                     Some(SessionKind::Headless(s)) => s,
                     None => return Err(VarreError::SessionNotFound(name.to_string()).into()),
                 };
-                let _ = session
+                if let Err(e) = session
                     .send_event(&SessionEvent::Completed, MAX_RETRIES)
-                    .await;
+                    .await
+                {
+                    tracing::error!(session = name, error = %e, "failed to transition session to Ready after completion");
+                }
                 self.consecutive_failures.store(0, Ordering::Relaxed);
                 self.sessions.save()?;
                 Ok(response)
@@ -182,12 +191,15 @@ impl<B: ClaudeBackend> Orchestrator<B> {
                     Some(SessionKind::Headless(s)) => s,
                     None => return Err(VarreError::SessionNotFound(name.to_string()).into()),
                 };
-                let _ = session
+                if let Err(te) = session
                     .send_event(
                         &SessionEvent::Failed(e.to_string()),
                         MAX_RETRIES,
                     )
-                    .await;
+                    .await
+                {
+                    tracing::error!(session = name, error = %te, "failed to transition session to Error after failure");
+                }
                 self.consecutive_failures.fetch_add(1, Ordering::Relaxed);
                 self.sessions.save()?;
                 Err(e)
@@ -243,6 +255,29 @@ impl<B: ClaudeBackend> Orchestrator<B> {
     pub fn cancel_token(&self) -> &CancellationToken {
         &self.cancel_token
     }
+
+    /// Reset the circuit breaker, allowing requests to flow again.
+    pub fn reset_circuit_breaker(&self) {
+        self.consecutive_failures.store(0, Ordering::Relaxed);
+        tracing::info!("circuit breaker reset");
+    }
+}
+
+/// Validate a session name: must be 1-64 chars, alphanumeric + hyphens/underscores.
+fn validate_session_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        bail!("session name cannot be empty");
+    }
+    if name.len() > 64 {
+        bail!("session name too long (max 64 characters)");
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        bail!("session name must contain only alphanumeric characters, hyphens, and underscores");
+    }
+    Ok(())
 }
 
 /// Load the name-to-ID mapping from a JSON file.
@@ -261,14 +296,22 @@ fn load_names(data_dir: &std::path::Path) -> Result<HashMap<String, SessionId>> 
     }
 }
 
-/// Persist the name-to-ID mapping to a JSON file.
+/// Persist the name-to-ID mapping to a JSON file (atomic: write tmp → fsync → rename).
 fn save_names(data_dir: &std::path::Path, names: &HashMap<String, SessionId>) -> Result<()> {
+    use std::io::Write;
+
     let path = data_dir.join("names.json");
+    let tmp_path = data_dir.join("names.json.tmp");
     let raw: HashMap<&str, &str> = names
         .iter()
         .map(|(name, id)| (name.as_str(), id.as_str()))
         .collect();
     let json = serde_json::to_string_pretty(&raw).context("failed to serialize names")?;
-    std::fs::write(&path, json).context("failed to write names file")?;
+
+    let mut file = std::fs::File::create(&tmp_path).context("failed to create temp names file")?;
+    file.write_all(json.as_bytes())
+        .context("failed to write temp names file")?;
+    file.sync_all().context("failed to fsync names file")?;
+    std::fs::rename(&tmp_path, &path).context("failed to rename names file")?;
     Ok(())
 }
