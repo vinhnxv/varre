@@ -3,6 +3,37 @@ use tokio::process::Command;
 
 use super::detection::{detect_status, strip_ansi, ClaudeStatus};
 
+/// Process metrics for a Claude Code session.
+#[derive(Debug, Clone, Default)]
+pub struct ProcessMetrics {
+    /// The Claude process PID (child of shell in pane).
+    pub pid: Option<u32>,
+    /// CPU usage percentage.
+    pub cpu_percent: Option<f32>,
+    /// Memory usage in MB.
+    pub mem_mb: Option<f32>,
+    /// Process start time (e.g. "14:32" or "Mar10").
+    pub started: Option<String>,
+    /// Process elapsed time (e.g. "01:23:45").
+    pub elapsed: Option<String>,
+    /// Tmux server PID.
+    pub tmux_pid: Option<u32>,
+    /// Number of MCP server child processes.
+    pub mcp_count: u32,
+    /// Number of teammate child processes.
+    pub mate_count: u32,
+    /// Git branch of the working directory.
+    pub git_branch: Option<String>,
+    /// Claude Code version (e.g. "2.1.74").
+    pub claude_version: Option<String>,
+    /// Claude Code config directory (CLAUDE_CONFIG_DIR or ~/.claude).
+    pub claude_config_dir: Option<String>,
+    /// GitHub PR number for the current branch (if any).
+    pub pr_number: Option<u32>,
+    /// Working directory of the claude session (pane's cwd).
+    pub cwd: Option<String>,
+}
+
 /// A Claude Code session discovered by scanning all tmux panes.
 #[derive(Debug, Clone)]
 pub struct DiscoveredSession {
@@ -20,6 +51,8 @@ pub struct DiscoveredSession {
     pub pane_content: Vec<String>,
     /// Pane dimensions (columns, rows).
     pub pane_size: (u16, u16),
+    /// Process metrics (PID, CPU, MEM, etc.).
+    pub metrics: ProcessMetrics,
 }
 
 /// Scans all tmux panes for running Claude Code sessions.
@@ -125,6 +158,65 @@ impl TmuxScanner {
             .map(|l| strip_ansi(l))
             .collect();
 
+        // Collect process metrics from the shell PID in the pane.
+        let mut metrics = if let Some(shell_pid) = pane.pane_pid {
+            collect_process_metrics(shell_pid).await
+        } else {
+            ProcessMetrics::default()
+        };
+
+        // Collect tmux server PID.
+        metrics.tmux_pid = get_tmux_server_pid().await;
+
+        // Count MCP servers and teammates under the claude process.
+        if let Some(claude_pid) = metrics.pid {
+            let (mcp, mates) = count_children(claude_pid).await;
+            metrics.mcp_count = mcp;
+            metrics.mate_count = mates;
+        }
+
+        // Get pane working directory, then derive git branch from it.
+        let pane_cwd = get_pane_cwd(&pane.pane_id).await;
+        metrics.git_branch = if let Some(ref cwd) = pane_cwd {
+            get_git_branch(cwd).await
+        } else {
+            None
+        };
+        // Shorten cwd for display (replace $HOME with ~).
+        metrics.cwd = pane_cwd.map(|cwd| {
+            let home = std::env::var("HOME").unwrap_or_default();
+            if !home.is_empty() && cwd.starts_with(&home) {
+                format!("~{}", &cwd[home.len()..])
+            } else {
+                cwd
+            }
+        });
+
+        // Get PR number for the current branch.
+        metrics.pr_number = if let (Some(ref cwd), Some(ref _branch)) = (&metrics.cwd, &metrics.git_branch) {
+            // Use the original (non-shortened) path isn't available, use cwd which may have ~
+            // Expand ~ back for the command
+            let full_cwd = if cwd.starts_with('~') {
+                let home = std::env::var("HOME").unwrap_or_default();
+                format!("{}{}", home, &cwd[1..])
+            } else {
+                cwd.clone()
+            };
+            get_pr_number(&full_cwd).await
+        } else {
+            None
+        };
+
+        // Extract Claude Code version from binary or pane content.
+        metrics.claude_version = get_claude_version(metrics.pid, &content).await;
+
+        // Detect Claude config dir from process environment.
+        metrics.claude_config_dir = if let Some(cpid) = metrics.pid {
+            get_claude_config_dir(cpid).await
+        } else {
+            None
+        };
+
         Ok(Some(DiscoveredSession {
             tmux_session: pane.session_name.clone(),
             tmux_window: pane.window_index,
@@ -133,6 +225,7 @@ impl TmuxScanner {
             claude_status: final_status,
             pane_content: lines,
             pane_size: (pane.width, pane.height),
+            metrics,
         }))
     }
 
@@ -152,6 +245,344 @@ impl TmuxScanner {
 
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
     }
+}
+
+/// Get the command name of a process by PID.
+async fn get_process_comm(pid: u32) -> Option<String> {
+    let output = Command::new("ps")
+        .args(["-o", "comm=", "-p", &pid.to_string()])
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let comm = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if comm.is_empty() { None } else { Some(comm) }
+}
+
+/// Find a claude child process under a shell PID.
+async fn find_claude_child(shell_pid: u32) -> Option<u32> {
+    let output = Command::new("ps")
+        .args(["-eo", "pid,ppid,comm"])
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout.lines().find_map(|line| {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 3 {
+            return None;
+        }
+        let pid: u32 = parts[0].parse().ok()?;
+        let ppid: u32 = parts[1].parse().ok()?;
+        let comm = parts[2..].join(" ").to_lowercase();
+        if ppid == shell_pid && (comm.contains("claude") || comm.contains("node")) {
+            Some(pid)
+        } else {
+            None
+        }
+    })
+}
+
+/// Collect process metrics for a Claude Code session.
+/// First checks if the pane PID itself is a claude process, then looks for child processes.
+async fn collect_process_metrics(pane_pid: u32) -> ProcessMetrics {
+    // Step 1: Check if pane_pid itself is a claude process (e.g. tmux launched claude directly).
+    let pane_comm = get_process_comm(pane_pid).await.unwrap_or_default().to_lowercase();
+    let is_claude_direct = pane_comm.contains("claude") || pane_comm.contains(".claude");
+
+    let target_pid = if is_claude_direct {
+        // Pane PID IS the claude process.
+        pane_pid
+    } else {
+        // Pane PID is a shell — find claude child process.
+        match find_claude_child(pane_pid).await {
+            Some(pid) => pid,
+            None => return ProcessMetrics { pid: None, ..Default::default() },
+        }
+    };
+
+    // Get metrics: ps -o pid,%cpu,rss,lstart,etime -p <pid>
+    let output = match Command::new("ps")
+        .args(["-o", "pid,%cpu,rss,lstart,etime", "-p", &target_pid.to_string()])
+        .output()
+        .await
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return ProcessMetrics { pid: Some(target_pid), ..Default::default() },
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Skip header line, parse data line
+    if let Some(line) = stdout.lines().nth(1) {
+        parse_ps_metrics(line, target_pid)
+    } else {
+        ProcessMetrics { pid: Some(target_pid), ..Default::default() }
+    }
+}
+
+/// Parse a ps output line with format: PID %CPU RSS LSTART ETIME
+/// LSTART is multi-word (e.g. "Wed Mar 12 14:32:00 2026"), ETIME is last field.
+fn parse_ps_metrics(line: &str, pid: u32) -> ProcessMetrics {
+    let parts: Vec<&str> = line.split_whitespace().collect();
+    // Minimum: pid, cpu, rss, + lstart(5 words) + etime = 9 fields
+    if parts.len() < 9 {
+        return ProcessMetrics { pid: Some(pid), ..Default::default() };
+    }
+
+    let cpu = parts[1].parse::<f32>().ok();
+    let rss_kb = parts[2].parse::<f32>().ok();
+    let mem_mb = rss_kb.map(|kb| kb / 1024.0);
+
+    // LSTART is 5 words: "Day Mon DD HH:MM:SS YYYY"
+    // Extract just "HH:MM:SS" for compact display
+    let started = if parts.len() >= 7 {
+        Some(parts[6].to_string()) // HH:MM:SS
+    } else {
+        None
+    };
+
+    // ETIME is the last field (e.g. "01:23:45" or "23:45")
+    let elapsed = parts.last().map(|s| s.to_string());
+
+    ProcessMetrics {
+        pid: Some(pid),
+        cpu_percent: cpu,
+        mem_mb,
+        started,
+        elapsed,
+        tmux_pid: None,
+        mcp_count: 0,
+        mate_count: 0,
+        git_branch: None,
+        claude_version: None,
+        claude_config_dir: None,
+        pr_number: None,
+        cwd: None,
+    }
+}
+
+/// Get the tmux server PID.
+async fn get_tmux_server_pid() -> Option<u32> {
+    let output = Command::new("tmux")
+        .args(["display-message", "-p", "#{pid}"])
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout).trim().parse().ok()
+}
+
+/// Count MCP server and teammate child processes under a claude PID.
+/// MCP: child with "server.py", "/mcp/", or "mcp-server" in command.
+/// Mates: child that is another "claude" or "node" process.
+async fn count_children(parent_pid: u32) -> (u32, u32) {
+    let output = match Command::new("ps")
+        .args(["-eo", "pid,ppid,args"])
+        .output()
+        .await
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return (0, 0),
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut mcp = 0u32;
+    let mut mates = 0u32;
+
+    for line in stdout.lines().skip(1) {
+        let parts: Vec<&str> = line.splitn(3, char::is_whitespace).collect();
+        if parts.len() < 3 {
+            continue;
+        }
+        let ppid: u32 = match parts[1].trim().parse() {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        if ppid != parent_pid {
+            continue;
+        }
+        let args = parts[2].to_lowercase();
+        if args.contains("server.py") || args.contains("/mcp/") || args.contains("mcp-server") {
+            mcp += 1;
+        } else if args.contains("claude") || args.contains("node") {
+            mates += 1;
+        }
+    }
+
+    (mcp, mates)
+}
+
+/// Get the current working directory of a tmux pane.
+async fn get_pane_cwd(pane_id: &str) -> Option<String> {
+    let output = Command::new("tmux")
+        .args(["display-message", "-t", pane_id, "-p", "#{pane_current_path}"])
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let cwd = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if cwd.is_empty() { None } else { Some(cwd) }
+}
+
+/// Get git branch for a given directory.
+async fn get_git_branch(cwd: &str) -> Option<String> {
+    let output = Command::new("git")
+        .args(["-C", cwd, "rev-parse", "--abbrev-ref", "HEAD"])
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if branch.is_empty() { None } else { Some(branch) }
+}
+
+/// Get the GitHub PR number for the current branch in a given directory.
+async fn get_pr_number(cwd: &str) -> Option<u32> {
+    let output = Command::new("gh")
+        .args(["pr", "view", "--json", "number", "-q", ".number"])
+        .current_dir(cwd)
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout).trim().parse().ok()
+}
+
+/// Extract Claude Code version from pane content (e.g. "Claude Code v2.1.74").
+/// Get Claude Code version from the binary resolved via the process PID.
+/// Falls back to parsing pane content if binary detection fails.
+async fn get_claude_version(pid: Option<u32>, content: &str) -> Option<String> {
+    // Try to get version from the binary itself (most reliable).
+    if let Some(p) = pid {
+        if let Some(ver) = get_version_from_process(p).await {
+            return Some(ver);
+        }
+    }
+    // Fallback: parse from pane content.
+    extract_claude_version_from_content(content)
+}
+
+/// Get version by finding the binary path from PID and running --version.
+async fn get_version_from_process(pid: u32) -> Option<String> {
+    // On macOS, get the binary path from the process.
+    let output = Command::new("ps")
+        .args(["-o", "comm=", "-p", &pid.to_string()])
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let binary = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if binary.is_empty() {
+        return None;
+    }
+
+    // Run `<binary> --version` to get the version string.
+    let output = Command::new(&binary)
+        .arg("--version")
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let ver_output = String::from_utf8_lossy(&output.stdout);
+    // Parse version from output like "Claude Code v2.1.74" or just "2.1.74"
+    for line in ver_output.lines() {
+        let trimmed = line.trim();
+        if let Some(pos) = trimmed.find("Claude Code v") {
+            let after = &trimmed[pos + "Claude Code v".len()..];
+            let version: String = after
+                .chars()
+                .take_while(|c| c.is_ascii_digit() || *c == '.')
+                .collect();
+            if !version.is_empty() {
+                return Some(version);
+            }
+        }
+        // Try bare version number.
+        let version: String = trimmed
+            .chars()
+            .take_while(|c| c.is_ascii_digit() || *c == '.')
+            .collect();
+        if version.contains('.') && version.len() >= 3 {
+            return Some(version);
+        }
+    }
+    None
+}
+
+/// Extract Claude Code version from pane content (fallback).
+fn extract_claude_version_from_content(content: &str) -> Option<String> {
+    let stripped = strip_ansi(content);
+    for line in stripped.lines() {
+        let trimmed = line.trim();
+        if let Some(pos) = trimmed.find("Claude Code v") {
+            let after = &trimmed[pos + "Claude Code v".len()..];
+            let version: String = after
+                .chars()
+                .take_while(|c| c.is_ascii_digit() || *c == '.')
+                .collect();
+            if !version.is_empty() {
+                return Some(version);
+            }
+        }
+    }
+    None
+}
+
+/// Get the CLAUDE_CONFIG_DIR from a process's environment, or detect ~/.claude-true / ~/.claude.
+async fn get_claude_config_dir(pid: u32) -> Option<String> {
+    // On macOS, read /proc is not available. Use `ps -Eww -p <pid>` to get environment.
+    let output = Command::new("ps")
+        .args(["-Eww", "-o", "command=", "-p", &pid.to_string()])
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let cmd_env = String::from_utf8_lossy(&output.stdout);
+    // Look for CLAUDE_CONFIG_DIR= in the environment
+    for part in cmd_env.split_whitespace() {
+        if let Some(val) = part.strip_prefix("CLAUDE_CONFIG_DIR=") {
+            if !val.is_empty() {
+                // Shorten home dir for display
+                let home = std::env::var("HOME").unwrap_or_default();
+                let display = if !home.is_empty() && val.starts_with(&home) {
+                    format!("~{}", &val[home.len()..])
+                } else {
+                    val.to_string()
+                };
+                return Some(display);
+            }
+        }
+    }
+    // Fallback: check if ~/.claude-true exists (multi-account setup)
+    if let Some(home) = dirs::home_dir() {
+        if home.join(".claude-true").exists() {
+            return Some("~/.claude-true".to_string());
+        }
+        if home.join(".claude").exists() {
+            return Some("~/.claude".to_string());
+        }
+    }
+    None
 }
 
 /// Check if pane content contains Claude Code-specific patterns beyond what

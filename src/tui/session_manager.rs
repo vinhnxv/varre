@@ -10,8 +10,6 @@ use crate::session::SessionId;
 use crate::tmux::detection::ClaudeStatus;
 use crate::tmux::TmuxWrapper;
 
-use super::event::AppEvent;
-
 /// Handle for a per-session polling task.
 struct SessionPollHandle {
     task: JoinHandle<()>,

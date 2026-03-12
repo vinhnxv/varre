@@ -23,12 +23,13 @@ pub fn render(f: &mut Frame, app: &App) {
 
     let area = f.area();
 
-    // Main layout: header + body + prompt + status bar.
+    // Main layout: header + body + session info + prompt + status bar.
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1), // header
             Constraint::Min(10),  // body (sidebar + output)
+            Constraint::Length(1), // session info bar
             Constraint::Length(3), // prompt input
             Constraint::Length(1), // status bar
         ])
@@ -36,8 +37,9 @@ pub fn render(f: &mut Frame, app: &App) {
 
     render_header(f, chunks[0]);
     render_body(f, chunks[1], app);
-    render_prompt_input(f, chunks[2], app);
-    render_status_bar(f, chunks[3], app);
+    render_session_info(f, chunks[2], app);
+    render_prompt_input(f, chunks[3], app);
+    render_status_bar(f, chunks[4], app);
 }
 
 /// Render the header bar.
@@ -132,6 +134,21 @@ fn render_output(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(output_widget, area);
 }
 
+/// Render the session info bar with process metrics.
+fn render_session_info(f: &mut Frame, area: Rect, app: &App) {
+    let info = app
+        .selected_session()
+        .map(|s| s.metrics_line())
+        .unwrap_or_default();
+
+    let bar = Paragraph::new(Line::from(vec![
+        Span::styled(" ", Style::default()),
+        Span::styled(info, Style::default().fg(Color::Cyan)),
+    ]));
+
+    f.render_widget(bar, area);
+}
+
 /// Render the prompt input / instructions area.
 fn render_prompt_input(f: &mut Frame, area: Rect, app: &App) {
     let has_sessions = !app.sessions.is_empty();
@@ -206,12 +223,59 @@ fn render_status_bar(f: &mut Frame, area: Rect, app: &App) {
         .as_deref()
         .unwrap_or("j/k: navigate | i: input | Ctrl+N: new | d: kill | q: quit");
 
+    // Branch + CWD of selected session, right-aligned with icons.
+    let branch_raw = app
+        .selected_session()
+        .and_then(|s| s.metrics.git_branch.as_deref())
+        .unwrap_or("-");
+    // Truncate long branch names.
+    let branch = if branch_raw.len() > 40 {
+        format!("{}...", &branch_raw[..37])
+    } else {
+        branch_raw.to_string()
+    };
+    let pr_number = app
+        .selected_session()
+        .and_then(|s| s.metrics.pr_number);
+    let pr_suffix = pr_number
+        .map(|n| format!(" #{n}"))
+        .unwrap_or_default();
+    let cwd = app
+        .selected_session()
+        .and_then(|s| s.metrics.cwd.as_deref())
+        .unwrap_or("-");
+    let right_display = format!(" \u{2387} {}{} \u{2502} {} ", branch, pr_suffix, cwd);
+
+    // Calculate left side width to pad with spaces for right-alignment.
+    let left_parts = format!(" {} {} sessions  {status_msg}", match app.input_mode {
+        InputMode::Normal => "NORMAL",
+        InputMode::Insert => "INSERT",
+    }, app.sessions.len());
+    let padding = (area.width as usize).saturating_sub(left_parts.len() + right_display.len());
+
     let bar = Paragraph::new(Line::from(vec![
         mode_indicator,
         session_count,
         Span::styled(
             format!(" {status_msg}"),
             Style::default().fg(Color::DarkGray),
+        ),
+        Span::raw(" ".repeat(padding)),
+        Span::styled(
+            format!(" \u{2387} {branch}"),
+            Style::default().fg(Color::Green),
+        ),
+        Span::styled(
+            format!("{pr_suffix} "),
+            Style::default().fg(Color::Yellow),
+        ),
+        Span::styled(
+            "\u{2502}",
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::styled(
+            format!(" {cwd} "),
+            Style::default().fg(Color::Cyan),
         ),
     ]));
 

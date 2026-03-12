@@ -1,5 +1,5 @@
 use crate::tmux::detection::ClaudeStatus;
-use crate::tmux::scanner::DiscoveredSession;
+use crate::tmux::scanner::{DiscoveredSession, ProcessMetrics};
 
 /// Input mode for the TUI.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,6 +25,8 @@ pub struct SessionViewModel {
     pub output_lines: Vec<String>,
     /// Pane dimensions (columns, rows).
     pub pane_size: (u16, u16),
+    /// Process metrics (PID, CPU, MEM, started, uptime).
+    pub metrics: ProcessMetrics,
 }
 
 impl SessionViewModel {
@@ -40,7 +42,49 @@ impl SessionViewModel {
             claude_status: session.claude_status.clone(),
             output_lines: session.pane_content.clone(),
             pane_size: session.pane_size,
+            metrics: session.metrics.clone(),
         }
+    }
+
+    /// Format the metrics info line for display.
+    pub fn metrics_line(&self) -> String {
+        let pid = self.metrics.pid
+            .map(|p| format!("PID:{p}"))
+            .unwrap_or_else(|| "PID:-".into());
+        let tmux = format!("TMUX:{}[{}]", self.tmux_session, self.pane_id);
+        let cpu = self.metrics.cpu_percent
+            .map(|c| format!("CPU:{c:.1}%"))
+            .unwrap_or_else(|| "CPU:-".into());
+        let mem = self.metrics.mem_mb
+            .map(|m| format!("MEM:{m:.0}MB"))
+            .unwrap_or_else(|| "MEM:-".into());
+        let started = self.metrics.started
+            .as_deref()
+            .map(|s| format!("START:{s}"))
+            .unwrap_or_else(|| "START:-".into());
+        let uptime = self.metrics.elapsed
+            .as_deref()
+            .map(|e| format!("UP:{e}"))
+            .unwrap_or_else(|| "UP:-".into());
+
+        let tmux_pid = self.metrics.tmux_pid
+            .map(|p| format!("TPID:{p}"))
+            .unwrap_or_else(|| "TPID:-".into());
+        let mcp = format!("MCP:{}", self.metrics.mcp_count);
+        let mates = format!("MATES:{}", self.metrics.mate_count);
+        let branch = self.metrics.git_branch
+            .as_deref()
+            .map(|b| format!("BR:{b}"))
+            .unwrap_or_else(|| "BR:-".into());
+        let version = self.metrics.claude_version
+            .as_deref()
+            .map(|v| format!("VER:{v}"))
+            .unwrap_or_else(|| "VER:-".into());
+        let ccdir = self.metrics.claude_config_dir
+            .as_deref()
+            .map(|d| format!("CCDIR:{d}"))
+            .unwrap_or_else(|| "CCDIR:-".into());
+        format!("{pid}  {version}  {tmux}  {cpu}  {mem}  {started}  {uptime}  {tmux_pid}  {mcp}  {mates}  {ccdir}")
     }
 
     /// Return the status icon for TUI display.
@@ -193,6 +237,7 @@ mod tests {
             claude_status: ClaudeStatus::Idle,
             pane_content: vec!["output".to_string()],
             pane_size: (200, 50),
+            metrics: ProcessMetrics::default(),
         }
     }
 
@@ -265,6 +310,7 @@ mod tests {
             claude_status: ClaudeStatus::Working,
             pane_content: vec![],
             pane_size: (200, 50),
+            metrics: ProcessMetrics::default(),
         };
         let vm = SessionViewModel::from_discovered(&discovered);
         assert_eq!(vm.status_icon(), "\u{25cf}"); // filled circle
