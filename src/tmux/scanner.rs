@@ -546,42 +546,39 @@ fn extract_claude_version_from_content(content: &str) -> Option<String> {
     None
 }
 
-/// Get the CLAUDE_CONFIG_DIR from a process's environment, or detect ~/.claude-true / ~/.claude.
+/// Detect which Claude config directory a process uses via `lsof`.
+/// This is the most reliable method on macOS since `/proc` is not available.
 async fn get_claude_config_dir(pid: u32) -> Option<String> {
-    // On macOS, read /proc is not available. Use `ps -Eww -p <pid>` to get environment.
-    let output = Command::new("ps")
-        .args(["-Eww", "-o", "command=", "-p", &pid.to_string()])
+    let home = std::env::var("HOME").unwrap_or_default();
+    if home.is_empty() {
+        return None;
+    }
+
+    // Use lsof to check which .claude* directory the process has open files in.
+    let output = Command::new("lsof")
+        .args(["-p", &pid.to_string()])
         .output()
         .await
         .ok()?;
     if !output.status.success() {
         return None;
     }
-    let cmd_env = String::from_utf8_lossy(&output.stdout);
-    // Look for CLAUDE_CONFIG_DIR= in the environment
-    for part in cmd_env.split_whitespace() {
-        if let Some(val) = part.strip_prefix("CLAUDE_CONFIG_DIR=") {
-            if !val.is_empty() {
-                // Shorten home dir for display
-                let home = std::env::var("HOME").unwrap_or_default();
-                let display = if !home.is_empty() && val.starts_with(&home) {
-                    format!("~{}", &val[home.len()..])
-                } else {
-                    val.to_string()
-                };
-                return Some(display);
-            }
-        }
-    }
-    // Fallback: check if ~/.claude-true exists (multi-account setup)
-    if let Some(home) = dirs::home_dir() {
-        if home.join(".claude-true").exists() {
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let pattern = format!("{home}/.claude");
+
+    // Check for .claude-true first (more specific), then .claude.
+    for line in stdout.lines() {
+        if line.contains(&format!("{home}/.claude-true")) {
             return Some("~/.claude-true".to_string());
         }
-        if home.join(".claude").exists() {
+    }
+    for line in stdout.lines() {
+        if line.contains(&pattern) {
             return Some("~/.claude".to_string());
         }
     }
+
     None
 }
 
