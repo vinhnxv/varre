@@ -1,9 +1,36 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use tokio::process::Command;
 
 use super::detection::{detect_status, strip_ansi, ClaudeStatus};
+
+/// Cache for stable per-PID data (version, config dir) that doesn't change during a session.
+#[derive(Debug, Clone, Default)]
+struct PidCache {
+    /// Claude version per PID.
+    versions: HashMap<u32, String>,
+    /// Config dir per PID.
+    config_dirs: HashMap<u32, String>,
+}
+
+/// Cache for data with a TTL (PR number per cwd+branch).
+#[derive(Debug, Clone)]
+struct TtlEntry<T> {
+    value: T,
+    cached_at: Instant,
+}
+
+/// Cache for PR numbers keyed by (cwd, branch).
+#[derive(Debug, Clone, Default)]
+struct PrCache {
+    entries: HashMap<(String, String), TtlEntry<Option<u32>>>,
+}
+
+const PR_CACHE_TTL_SECS: u64 = 60;
 
 /// Process metrics for a Claude Code session.
 #[derive(Debug, Clone, Default)]
@@ -66,6 +93,10 @@ pub struct TmuxScanner {
     prompt_marker: String,
     /// Number of lines to capture from each pane.
     capture_lines: i32,
+    /// Cache for stable per-PID data.
+    pid_cache: Arc<Mutex<PidCache>>,
+    /// Cache for PR numbers with TTL.
+    pr_cache: Arc<Mutex<PrCache>>,
 }
 
 impl TmuxScanner {
@@ -74,6 +105,8 @@ impl TmuxScanner {
         Self {
             prompt_marker,
             capture_lines: 30,
+            pid_cache: Arc::new(Mutex::new(PidCache::default())),
+            pr_cache: Arc::new(Mutex::new(PrCache::default())),
         }
     }
 
@@ -86,15 +119,22 @@ impl TmuxScanner {
     /// Scan all tmux panes and return only those running Claude Code.
     pub async fn scan(&self) -> Result<Vec<DiscoveredSession>> {
         let panes = self.list_all_panes().await?;
-        let mut sessions = Vec::new();
 
-        for pane in panes {
-            match self.inspect_pane(&pane).await {
+        // Inspect all panes concurrently for better scan latency.
+        let futures: Vec<_> = panes
+            .iter()
+            .map(|pane| self.inspect_pane(pane))
+            .collect();
+        let results = futures::future::join_all(futures).await;
+
+        let mut sessions = Vec::new();
+        for (i, result) in results.into_iter().enumerate() {
+            match result {
                 Ok(Some(discovered)) => sessions.push(discovered),
                 Ok(None) => {} // not a Claude Code pane
                 Err(e) => {
                     tracing::debug!(
-                        pane_id = %pane.pane_id,
+                        pane_id = %panes[i].pane_id,
                         error = %e,
                         "failed to inspect pane, skipping"
                     );
@@ -157,35 +197,49 @@ impl TmuxScanner {
             status
         };
 
-        let lines: Vec<String> = content
+        // Strip ANSI once, reuse for all consumers.
+        let stripped_content = strip_ansi(&content);
+        let lines: Vec<String> = stripped_content
             .lines()
-            .map(|l| strip_ansi(l))
+            .map(|l| l.to_string())
             .collect();
 
-        // Collect process metrics from the shell PID in the pane.
-        let mut metrics = if let Some(shell_pid) = pane.pane_pid {
-            collect_process_metrics(shell_pid).await
-        } else {
-            ProcessMetrics::default()
+        // Run independent data collection concurrently.
+        let (metrics_result, tmux_pid, pane_cwd) = tokio::join!(
+            async {
+                if let Some(shell_pid) = pane.pane_pid {
+                    collect_process_metrics(shell_pid).await
+                } else {
+                    ProcessMetrics::default()
+                }
+            },
+            get_tmux_server_pid(),
+            get_pane_cwd(&pane.pane_id),
+        );
+
+        let mut metrics = metrics_result;
+        metrics.tmux_pid = tmux_pid;
+
+        // Count children and get git branch concurrently.
+        let children_future = async {
+            if let Some(claude_pid) = metrics.pid {
+                count_children(claude_pid).await
+            } else {
+                (0, 0)
+            }
         };
-
-        // Collect tmux server PID.
-        metrics.tmux_pid = get_tmux_server_pid().await;
-
-        // Count MCP servers and teammates under the claude process.
-        if let Some(claude_pid) = metrics.pid {
-            let (mcp, mates) = count_children(claude_pid).await;
-            metrics.mcp_count = mcp;
-            metrics.mate_count = mates;
-        }
-
-        // Get pane working directory, then derive git branch from it.
-        let pane_cwd = get_pane_cwd(&pane.pane_id).await;
-        metrics.git_branch = if let Some(ref cwd) = pane_cwd {
-            get_git_branch(cwd).await
-        } else {
-            None
+        let branch_future = async {
+            if let Some(ref cwd) = pane_cwd {
+                get_git_branch(cwd).await
+            } else {
+                None
+            }
         };
+        let ((mcp, mates), git_branch) = tokio::join!(children_future, branch_future);
+        metrics.mcp_count = mcp;
+        metrics.mate_count = mates;
+        metrics.git_branch = git_branch;
+
         // Shorten cwd for display (replace $HOME with ~).
         metrics.cwd = pane_cwd.map(|cwd| {
             let home = std::env::var("HOME").unwrap_or_default();
@@ -196,27 +250,65 @@ impl TmuxScanner {
             }
         });
 
-        // Get PR number for the current branch.
-        metrics.pr_number = if let (Some(ref cwd), Some(ref _branch)) = (&metrics.cwd, &metrics.git_branch) {
-            // Use the original (non-shortened) path isn't available, use cwd which may have ~
-            // Expand ~ back for the command
-            let full_cwd = if cwd.starts_with('~') {
-                let home = std::env::var("HOME").unwrap_or_default();
-                format!("{}{}", home, &cwd[1..])
+        // Get PR number with cache (TTL-based).
+        metrics.pr_number = if let (Some(ref cwd), Some(ref branch)) = (&metrics.cwd, &metrics.git_branch) {
+            let cache_key = (cwd.clone(), branch.clone());
+            let cached = self.pr_cache.lock().ok().and_then(|cache| {
+                cache.entries.get(&cache_key).and_then(|entry| {
+                    if entry.cached_at.elapsed().as_secs() < PR_CACHE_TTL_SECS {
+                        Some(entry.value)
+                    } else {
+                        None
+                    }
+                })
+            });
+            if let Some(pr) = cached {
+                pr
             } else {
-                cwd.clone()
-            };
-            get_pr_number(&full_cwd).await
+                let full_cwd = if cwd.starts_with('~') {
+                    let home = std::env::var("HOME").unwrap_or_default();
+                    format!("{}{}", home, &cwd[1..])
+                } else {
+                    cwd.clone()
+                };
+                let pr = get_pr_number(&full_cwd).await;
+                if let Ok(mut cache) = self.pr_cache.lock() {
+                    cache.entries.insert(cache_key, TtlEntry { value: pr, cached_at: Instant::now() });
+                }
+                pr
+            }
         } else {
             None
         };
 
-        // Extract Claude Code version from binary or pane content.
-        metrics.claude_version = get_claude_version(metrics.pid, &content).await;
+        // Get Claude version with per-PID cache.
+        metrics.claude_version = if let Some(pid) = metrics.pid {
+            let cached = self.pid_cache.lock().ok().and_then(|c| c.versions.get(&pid).cloned());
+            if let Some(ver) = cached {
+                Some(ver)
+            } else {
+                let ver = get_claude_version(Some(pid), &stripped_content).await;
+                if let (Some(ref v), Ok(mut cache)) = (&ver, self.pid_cache.lock()) {
+                    cache.versions.insert(pid, v.clone());
+                }
+                ver
+            }
+        } else {
+            get_claude_version(None, &stripped_content).await
+        };
 
-        // Detect Claude config dir from process environment.
+        // Get Claude config dir with per-PID cache.
         metrics.claude_config_dir = if let Some(cpid) = metrics.pid {
-            get_claude_config_dir(cpid).await
+            let cached = self.pid_cache.lock().ok().and_then(|c| c.config_dirs.get(&cpid).cloned());
+            if let Some(dir) = cached {
+                Some(dir)
+            } else {
+                let dir = get_claude_config_dir(cpid).await;
+                if let (Some(ref d), Ok(mut cache)) = (&dir, self.pid_cache.lock()) {
+                    cache.config_dirs.insert(cpid, d.clone());
+                }
+                dir
+            }
         } else {
             None
         };
@@ -410,18 +502,18 @@ async fn count_children(parent_pid: u32) -> (u32, u32) {
     let mut mates = 0u32;
 
     for line in stdout.lines().skip(1) {
-        let parts: Vec<&str> = line.splitn(3, char::is_whitespace).collect();
+        let parts: Vec<&str> = line.split_whitespace().collect();
         if parts.len() < 3 {
             continue;
         }
-        let ppid: u32 = match parts[1].trim().parse() {
+        let ppid: u32 = match parts[1].parse() {
             Ok(p) => p,
             Err(_) => continue,
         };
         if ppid != parent_pid {
             continue;
         }
-        let args = parts[2].to_lowercase();
+        let args = parts[2..].join(" ").to_lowercase();
         if args.contains("server.py") || args.contains("/mcp/") || args.contains("mcp-server") {
             mcp += 1;
         } else if args.contains("claude") || args.contains("node") {
@@ -540,9 +632,9 @@ async fn get_version_from_process(pid: u32) -> Option<String> {
 }
 
 /// Extract Claude Code version from pane content (fallback).
+/// Expects pre-stripped content (no ANSI codes).
 fn extract_claude_version_from_content(content: &str) -> Option<String> {
-    let stripped = strip_ansi(content);
-    for line in stripped.lines() {
+    for line in content.lines() {
         let trimmed = line.trim();
         if let Some(pos) = trimmed.find("Claude Code v") {
             let after = &trimmed[pos + "Claude Code v".len()..];

@@ -123,12 +123,10 @@ impl Default for TuiConfig {
 impl Config {
     pub fn load() -> Result<Self> {
         let path = Self::config_path();
-        if path.exists() {
-            let content =
-                std::fs::read_to_string(&path).context("failed to read config file")?;
-            toml::from_str(&content).context("failed to parse config file")
-        } else {
-            Ok(Self::default())
+        match std::fs::read_to_string(&path) {
+            Ok(content) => toml::from_str(&content).context("failed to parse config file"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(e) => Err(anyhow::anyhow!(e).context("failed to read config file")),
         }
     }
 

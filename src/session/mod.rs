@@ -134,12 +134,8 @@ enum SessionKindData {
 
 impl From<&HeadlessSession> for HeadlessSessionData {
     fn from(session: &HeadlessSession) -> Self {
-        // Use try_read to avoid async in a sync context; the store holds the write lock.
-        let state = session
-            .state
-            .try_read()
-            .map(|s| s.clone())
-            .unwrap_or(SessionState::Creating);
+        // Use blocking_read to get actual state; try_read could silently return wrong state.
+        let state = session.state.blocking_read().clone();
         Self {
             id: session.id.clone(),
             state,

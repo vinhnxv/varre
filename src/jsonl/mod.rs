@@ -42,15 +42,17 @@ pub fn resolve_jsonl_path(cwd: &str, config_dir: Option<&str>) -> Option<PathBuf
         }
     }
 
-    // Fallback: scan all dirs under projects/ and match by decoded path.
+    // Fallback: scan all dirs under projects/ and match by encoded name.
+    // Note: the encoding (replace '/' with '-') is lossy for paths with hyphens,
+    // so we compare encoded forms rather than trying to reverse-decode.
     for base in &dirs_to_check {
         let projects_dir = base.join("projects");
         if let Ok(entries) = fs::read_dir(&projects_dir) {
             for entry in entries.flatten() {
                 if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
                     let dir_name = entry.file_name().to_string_lossy().to_string();
-                    let decoded = dir_name.replace('-', "/");
-                    if decoded == expanded_cwd || decoded == format!("/{}", expanded_cwd.trim_start_matches('/')) {
+                    // Compare encoded form directly — avoids lossy reverse-decoding.
+                    if dir_name == encoded {
                         if let Some(path) = find_newest_jsonl(&entry.path()) {
                             return Some(path);
                         }
@@ -471,10 +473,11 @@ fn summarize_tool_input(name: &str, input: &serde_json::Value) -> String {
 }
 
 fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
+    if s.chars().count() <= max {
         s.to_string()
     } else {
-        format!("{}...", &s[..max.min(s.len())])
+        let end = s.char_indices().nth(max).map(|(i, _)| i).unwrap_or(s.len());
+        format!("{}...", &s[..end])
     }
 }
 

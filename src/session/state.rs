@@ -13,7 +13,7 @@ pub enum SessionState {
     /// Carries retry context from Error state for proper accumulation.
     Busy { retry_count: u32 },
     /// Session is waiting for user input (permission prompt).
-    WaitingInput,
+    WaitingInput { retry_count: u32 },
     /// Session encountered an error and may be retried.
     Error {
         /// Number of consecutive retries attempted.
@@ -85,8 +85,7 @@ impl SessionState {
                 })
             }
             (SessionState::Busy { retry_count }, SessionEvent::PermissionPrompt) => {
-                let _ = retry_count;
-                Ok(SessionState::WaitingInput)
+                Ok(SessionState::WaitingInput { retry_count: *retry_count })
             }
             (SessionState::Busy { retry_count }, SessionEvent::Timeout) => {
                 Ok(SessionState::Error {
@@ -96,15 +95,15 @@ impl SessionState {
             }
             (SessionState::Busy { .. }, SessionEvent::Killed) => Ok(SessionState::Dead),
 
-            // WaitingInput transitions
-            (SessionState::WaitingInput, SessionEvent::PermissionResolved) => {
-                Ok(SessionState::Busy { retry_count: 0 })
+            // WaitingInput transitions — preserve retry_count
+            (SessionState::WaitingInput { retry_count }, SessionEvent::PermissionResolved) => {
+                Ok(SessionState::Busy { retry_count: *retry_count })
             }
-            (SessionState::WaitingInput, SessionEvent::Timeout) => Ok(SessionState::Error {
-                retry_count: 0,
+            (SessionState::WaitingInput { retry_count }, SessionEvent::Timeout) => Ok(SessionState::Error {
+                retry_count: *retry_count,
                 last_error: "timeout waiting for input".to_string(),
             }),
-            (SessionState::WaitingInput, SessionEvent::Killed) => Ok(SessionState::Dead),
+            (SessionState::WaitingInput { .. }, SessionEvent::Killed) => Ok(SessionState::Dead),
 
             // Error transitions
             (
@@ -226,12 +225,12 @@ mod tests {
         let result = state
             .transition(&SessionEvent::PermissionPrompt, 3)
             .unwrap();
-        assert_eq!(result, SessionState::WaitingInput);
+        assert_eq!(result, SessionState::WaitingInput { retry_count: 0 });
     }
 
     #[test]
     fn test_waiting_resolved_becomes_busy() {
-        let state = SessionState::WaitingInput;
+        let state = SessionState::WaitingInput { retry_count: 0 };
         let result = state
             .transition(&SessionEvent::PermissionResolved, 3)
             .unwrap();

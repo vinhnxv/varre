@@ -159,17 +159,6 @@ pub async fn run(config: Config, cancel_token: CancellationToken) -> Result<()> 
                     }
                     app.update_sessions(sessions);
                 }
-                AppEvent::JsonlUpdated {
-                    pane_id,
-                    new_entries,
-                    stats_delta: _,
-                } => {
-                    let jstate = app
-                        .jsonl_states
-                        .entry(pane_id)
-                        .or_default();
-                    jstate.append_entries(new_entries, 0);
-                }
                 AppEvent::Resize(w, h) => {
                     app.terminal_size = (w, h);
                 }
@@ -214,8 +203,8 @@ pub async fn run(config: Config, cancel_token: CancellationToken) -> Result<()> 
 async fn handle_key_event(
     app: &mut App,
     key: crossterm::event::KeyEvent,
-    tmux: &TmuxWrapper,
-    config: &Config,
+    _tmux: &TmuxWrapper,
+    _config: &Config,
 ) {
     match app.input_mode {
         InputMode::Normal => match key.code {
@@ -353,10 +342,22 @@ async fn send_prompt_to_pane(pane_id: &str, prompt: &str) -> Result<()> {
 /// Spawn a new detached tmux session running Claude Code.
 /// Returns the session name. The monitor task will auto-discover it.
 async fn spawn_claude_session(config: &Config) -> Result<String> {
-    use std::sync::atomic::{AtomicU32, Ordering};
-    static COUNTER: AtomicU32 = AtomicU32::new(1);
-
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    // Find next available session number by checking existing tmux sessions.
+    let existing = tokio::process::Command::new("tmux")
+        .args(["list-sessions", "-F", "#{session_name}"])
+        .output()
+        .await
+        .ok();
+    let max_n = existing
+        .as_ref()
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|name| name.strip_prefix("varre-agent-"))
+        .filter_map(|s| s.parse::<u32>().ok())
+        .max()
+        .unwrap_or(0);
+    let n = max_n + 1;
     let session_name = format!("varre-agent-{n}");
     let binary = &config.claude.binary;
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
@@ -378,7 +379,7 @@ async fn spawn_claude_session(config: &Config) -> Result<String> {
 
     // Start Claude Code in the session.
     let output = tokio::process::Command::new("tmux")
-        .args(["send-keys", "-t", &session_name, binary, "Enter"])
+        .args(["send-keys", "-t", &session_name, "-l", binary])
         .output()
         .await?;
 
@@ -386,6 +387,12 @@ async fn spawn_claude_session(config: &Config) -> Result<String> {
         let stderr = String::from_utf8_lossy(&output.stderr);
         anyhow::bail!("failed to start claude: {}", stderr.trim());
     }
+
+    // Send Enter separately (not via -l which would send literal "Enter" text)
+    tokio::process::Command::new("tmux")
+        .args(["send-keys", "-t", &session_name, "Enter"])
+        .output()
+        .await?;
 
     Ok(session_name)
 }

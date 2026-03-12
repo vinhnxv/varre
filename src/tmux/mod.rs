@@ -9,19 +9,6 @@ use tokio::process::Command;
 use crate::config::TmuxConfig;
 use crate::error::VarreError;
 
-pub use detection::{detect_status, ClaudeStatus};
-
-/// Information about a tmux session managed by varre.
-#[derive(Debug, Clone)]
-pub struct TmuxSessionInfo {
-    /// Session name (without prefix).
-    pub name: String,
-    /// Full tmux session name (with prefix).
-    pub full_name: String,
-    /// Last activity timestamp.
-    pub activity: Option<String>,
-}
-
 /// Thin async wrapper around tmux CLI commands.
 #[derive(Debug)]
 pub struct TmuxWrapper {
@@ -212,62 +199,11 @@ impl TmuxWrapper {
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
     }
 
-    /// Detect the status of Claude Code in a tmux session.
-    pub async fn detect_session_status(&self, name: &str) -> Result<ClaudeStatus> {
-        let output = self.capture_pane(name, 50).await?;
-        Ok(detect_status(&output, &self.prompt_marker))
-    }
-
-    /// List all varre-managed tmux sessions (filtered by prefix).
-    pub async fn list_sessions(&self) -> Result<Vec<TmuxSessionInfo>> {
-        let output = Command::new("tmux")
-            .args([
-                "list-sessions",
-                "-F",
-                "#{session_name}:#{session_activity}",
-            ])
-            .output()
-            .await;
-
-        let output = match output {
-            Ok(o) => o,
-            Err(_) => return Ok(Vec::new()), // tmux not running
-        };
-
-        if !output.status.success() {
-            // No sessions or server not running
-            return Ok(Vec::new());
-        }
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let sessions = stdout
-            .lines()
-            .filter_map(|line| {
-                let parts: Vec<&str> = line.splitn(2, ':').collect();
-                if parts.len() < 2 {
-                    return None;
-                }
-                let full_name = parts[0];
-                if !full_name.starts_with(&self.prefix) {
-                    return None;
-                }
-                let name = full_name.strip_prefix(&self.prefix)?.to_string();
-                Some(TmuxSessionInfo {
-                    name,
-                    full_name: full_name.to_string(),
-                    activity: Some(parts[1].to_string()),
-                })
-            })
-            .collect();
-
-        Ok(sessions)
-    }
-
     /// Start Claude Code in a tmux session using the given binary path.
     pub async fn start_claude_with_binary(&self, name: &str, binary: &str) -> Result<()> {
         let full_name = self.session_name(name);
         let output = Command::new("tmux")
-            .args(["send-keys", "-t", &full_name, binary, "Enter"])
+            .args(["send-keys", "-t", &full_name, "-l", binary])
             .output()
             .await
             .context("failed to start claude in tmux")?;
@@ -276,6 +212,13 @@ impl TmuxWrapper {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(VarreError::TmuxCommandFailed(stderr.to_string()).into());
         }
+
+        // Send Enter separately (not via -l which would send literal "Enter" text)
+        Command::new("tmux")
+            .args(["send-keys", "-t", &full_name, "Enter"])
+            .output()
+            .await
+            .context("failed to send Enter in tmux")?;
 
         Ok(())
     }

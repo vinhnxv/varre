@@ -12,7 +12,6 @@ use crate::config::Config;
 use crate::error::VarreError;
 use crate::session::state::{SessionEvent, SessionState};
 use crate::session::{HeadlessSession, InteractiveSession, SessionId, SessionKind, SessionStore};
-use crate::tmux::detection::ClaudeStatus;
 use crate::tmux::TmuxWrapper;
 
 /// Maximum consecutive failures before the circuit breaker opens.
@@ -134,20 +133,6 @@ impl<B: ClaudeBackend> Orchestrator<B> {
             Some(SessionKind::Headless(_)) => {
                 bail!("capture is only available for interactive (tmux) sessions")
             }
-            None => Err(VarreError::SessionNotFound(name.to_string()).into()),
-        }
-    }
-
-    /// Get the Claude Code status for an interactive session.
-    pub async fn session_status(&self, name: &str) -> Result<ClaudeStatus> {
-        let id = self
-            .names
-            .get(name)
-            .ok_or_else(|| VarreError::SessionNotFound(name.to_string()))?;
-
-        match self.sessions.get(id) {
-            Some(SessionKind::Interactive(session)) => Ok(session.status().await),
-            Some(SessionKind::Headless(_)) => Ok(ClaudeStatus::Unknown),
             None => Err(VarreError::SessionNotFound(name.to_string()).into()),
         }
     }
@@ -280,6 +265,7 @@ impl<B: ClaudeBackend> Orchestrator<B> {
             model: Some(session.config.model.clone()),
             working_dir: Some(session.working_dir.clone()),
             timeout_secs: Some(self.config.defaults.timeout_seconds),
+            max_budget_usd: Some(self.config.claude.max_budget_usd),
             ..Default::default()
         };
 
@@ -391,21 +377,6 @@ impl<B: ClaudeBackend> Orchestrator<B> {
         Ok(())
     }
 
-    /// Return a reference to the cancellation token.
-    pub fn cancel_token(&self) -> &CancellationToken {
-        &self.cancel_token
-    }
-
-    /// Check if a session name already exists.
-    pub fn has_session(&self, name: &str) -> bool {
-        self.names.contains_key(name)
-    }
-
-    /// Reset the circuit breaker, allowing requests to flow again.
-    pub fn reset_circuit_breaker(&self) {
-        self.consecutive_failures.store(0, Ordering::Relaxed);
-        tracing::info!("circuit breaker reset");
-    }
 }
 
 /// Validate a session name: must be 1-64 chars, alphanumeric + hyphens/underscores.

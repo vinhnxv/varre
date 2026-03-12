@@ -339,11 +339,18 @@ fn wrap_text(text: &str, max_width: usize) -> Vec<String> {
                 result.push(remaining.to_string());
                 break;
             }
-            // Find a break point — prefer space within max_width.
-            let break_at = remaining[..max_width]
+            // Find a char-boundary-safe cutoff at most max_width bytes.
+            let safe_end = remaining
+                .char_indices()
+                .map(|(i, _)| i)
+                .take_while(|&i| i <= max_width)
+                .last()
+                .unwrap_or(remaining.len());
+            // Prefer breaking at a space within safe_end.
+            let break_at = remaining[..safe_end]
                 .rfind(' ')
                 .map(|pos| pos + 1) // include the space
-                .unwrap_or(max_width);
+                .unwrap_or(safe_end);
             result.push(remaining[..break_at].to_string());
             remaining = &remaining[break_at..];
         }
@@ -629,10 +636,11 @@ fn strip_xml_tags(text: &str) -> String {
 }
 
 fn truncate_display(s: &str, max: usize) -> String {
-    if s.len() <= max {
+    if s.chars().count() <= max {
         s.to_string()
     } else {
-        format!("{}...", &s[..max])
+        let end = s.char_indices().nth(max).map(|(i, _)| i).unwrap_or(s.len());
+        format!("{}...", &s[..end])
     }
 }
 
@@ -775,8 +783,9 @@ fn render_status_bar(f: &mut Frame, area: Rect, app: &App) {
         .selected_session()
         .and_then(|s| s.metrics.git_branch.as_deref())
         .unwrap_or("-");
-    let branch = if branch_raw.len() > 40 {
-        format!("{}...", &branch_raw[..37])
+    let branch = if branch_raw.chars().count() > 40 {
+        let end = branch_raw.char_indices().nth(37).map(|(i, _)| i).unwrap_or(branch_raw.len());
+        format!("{}...", &branch_raw[..end])
     } else {
         branch_raw.to_string()
     };

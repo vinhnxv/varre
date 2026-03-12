@@ -78,7 +78,7 @@ impl SessionViewModel {
             .unwrap_or_else(|| "TPID:-".into());
         let mcp = format!("MCP:{}", self.metrics.mcp_count);
         let mates = format!("MATES:{}", self.metrics.mate_count);
-        let branch = self.metrics.git_branch
+        let _branch = self.metrics.git_branch
             .as_deref()
             .map(|b| format!("BR:{b}"))
             .unwrap_or_else(|| "BR:-".into());
