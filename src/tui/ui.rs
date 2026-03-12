@@ -139,9 +139,9 @@ fn render_prompt_input(f: &mut Frame, area: Rect, app: &App) {
     let (title, text_style, border_style, hint) = match app.input_mode {
         InputMode::Normal => {
             let hint = if !has_sessions {
-                "No Claude Code sessions found in tmux. Start one in any tmux pane."
+                "No Claude Code sessions found. Press Ctrl+N to create one."
             } else {
-                "Press 'i' to send a prompt | 'r' to refresh | 'q' to quit"
+                "Press 'i' to send a prompt | Ctrl+N: new session | 'd': kill | 'q': quit"
             };
             (
                 " Instructions ",
@@ -204,7 +204,7 @@ fn render_status_bar(f: &mut Frame, area: Rect, app: &App) {
     let status_msg = app
         .status_message
         .as_deref()
-        .unwrap_or("j/k: navigate | i: input | d: kill pane | q: quit");
+        .unwrap_or("j/k: navigate | i: input | Ctrl+N: new | d: kill | q: quit");
 
     let bar = Paragraph::new(Line::from(vec![
         mode_indicator,

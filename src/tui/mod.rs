@@ -92,6 +92,20 @@ pub async fn run(config: Config, cancel_token: CancellationToken) -> Result<()> 
                         && key.code == KeyCode::Char('c')
                     {
                         app.should_quit = true;
+                    } else if key.modifiers.contains(KeyModifiers::CONTROL)
+                        && key.code == KeyCode::Char('n')
+                    {
+                        // Ctrl+N: create new tmux session with Claude Code.
+                        match spawn_claude_session(&config).await {
+                            Ok(name) => {
+                                app.status_message =
+                                    Some(format!("Created session '{name}' — will appear on next scan"));
+                            }
+                            Err(e) => {
+                                app.status_message =
+                                    Some(format!("Error creating session: {e}"));
+                            }
+                        }
                     } else {
                         handle_key_event(&mut app, key, &tmux, &config).await;
                     }
@@ -207,10 +221,10 @@ async fn handle_key_event(
             KeyCode::Enter => {
                 if !app.input_buffer.is_empty() {
                     if let Some(session) = app.selected_session() {
-                        let session_name = session.tmux_session.clone();
+                        let pane_id = session.pane_id.clone();
                         let display = session.display_name.clone();
                         let prompt = app.input_buffer.drain(..).collect::<String>();
-                        match send_prompt_via_tmux(tmux, &session_name, &prompt, config).await {
+                        match send_prompt_to_pane(&pane_id, &prompt).await {
                             Ok(()) => {
                                 app.status_message =
                                     Some(format!("Sent prompt to '{display}'"));
@@ -234,14 +248,84 @@ async fn handle_key_event(
     }
 }
 
-/// Send a prompt to a tmux session using the Escape+delay+Enter workaround.
-async fn send_prompt_via_tmux(
-    tmux: &TmuxWrapper,
-    session_name: &str,
-    prompt: &str,
-    _config: &Config,
-) -> Result<()> {
-    tmux.send_keys(session_name, prompt).await
+/// Send a prompt to a tmux pane using the Escape+delay+Enter workaround.
+/// Uses pane_id directly (e.g. "%5") to avoid prefix issues.
+async fn send_prompt_to_pane(pane_id: &str, prompt: &str) -> Result<()> {
+    use tokio::process::Command;
+
+    // Step 1: Send text literally.
+    let output = Command::new("tmux")
+        .args(["send-keys", "-t", pane_id, "-l", prompt])
+        .output()
+        .await?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("send-keys failed: {}", stderr.trim());
+    }
+
+    // Step 2: Wait for autocomplete to render.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Step 3: Dismiss autocomplete.
+    Command::new("tmux")
+        .args(["send-keys", "-t", pane_id, "Escape"])
+        .output()
+        .await?;
+
+    // Step 4: Brief wait.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Step 5: Submit.
+    let output = Command::new("tmux")
+        .args(["send-keys", "-t", pane_id, "Enter"])
+        .output()
+        .await?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("send Enter failed: {}", stderr.trim());
+    }
+
+    Ok(())
+}
+
+/// Spawn a new detached tmux session running Claude Code.
+/// Returns the session name. The monitor task will auto-discover it.
+async fn spawn_claude_session(config: &Config) -> Result<String> {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static COUNTER: AtomicU32 = AtomicU32::new(1);
+
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let session_name = format!("varre-agent-{n}");
+    let binary = &config.claude.binary;
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+
+    // Create detached tmux session.
+    let output = tokio::process::Command::new("tmux")
+        .args([
+            "new-session", "-d", "-s", &session_name,
+            "-x", "200", "-y", "50",
+            "-c", &cwd.to_string_lossy(),
+        ])
+        .output()
+        .await?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("tmux new-session failed: {}", stderr.trim());
+    }
+
+    // Start Claude Code in the session.
+    let output = tokio::process::Command::new("tmux")
+        .args(["send-keys", "-t", &session_name, binary, "Enter"])
+        .output()
+        .await?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("failed to start claude: {}", stderr.trim());
+    }
+
+    Ok(session_name)
 }
 
 /// Kill a tmux pane by its pane ID.
