@@ -2,6 +2,7 @@ mod backend;
 mod cli;
 mod config;
 mod error;
+mod jsonl;
 mod monitor;
 mod orchestrator;
 mod queue;

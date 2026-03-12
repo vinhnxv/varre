@@ -5,7 +5,9 @@ use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
 use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
-use super::app::{App, InputMode};
+use crate::jsonl::{self, ContentBlock, JsonlViewState, ParsedEntry};
+
+use super::app::{App, InputMode, ViewMode};
 
 /// Render the TUI layout.
 pub fn render(f: &mut Frame, app: &App) {
@@ -106,16 +108,27 @@ fn render_sidebar(f: &mut Frame, area: Rect, app: &App) {
 
 /// Render the output panel for the selected session.
 fn render_output(f: &mut Frame, area: Rect, app: &App) {
+    match app.view_mode {
+        ViewMode::Raw => render_raw_output(f, area, app),
+        ViewMode::Jsonl => render_jsonl_output(f, area, app),
+    }
+}
+
+/// Render Raw mode output (tmux capture-pane).
+fn render_raw_output(f: &mut Frame, area: Rect, app: &App) {
     let output = app.selected_output();
+    let mode_tag = match app.view_mode {
+        ViewMode::Raw => "[RAW]",
+        ViewMode::Jsonl => "[JSONL]",
+    };
     let title = app
         .selected_session()
-        .map(|s| format!(" Output — {} ({}) ", s.display_name, s.status_text()))
+        .map(|s| format!(" Output — {} ({}) {mode_tag} ", s.display_name, s.status_text()))
         .unwrap_or_else(|| " Output ".to_string());
 
     let total_lines = output.len() as u16;
-    let visible_height = area.height.saturating_sub(2); // borders
+    let visible_height = area.height.saturating_sub(2);
 
-    // Calculate scroll position.
     let scroll = if app.auto_scroll {
         total_lines.saturating_sub(visible_height)
     } else {
@@ -134,12 +147,277 @@ fn render_output(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(output_widget, area);
 }
 
-/// Render the session info bar with process metrics.
-fn render_session_info(f: &mut Frame, area: Rect, app: &App) {
-    let info = app
+/// Render JSONL mode output (structured session log).
+fn render_jsonl_output(f: &mut Frame, area: Rect, app: &App) {
+    let pane_id = app.selected_session().map(|s| s.pane_id.as_str());
+    let jstate = pane_id.and_then(|pid| app.jsonl_states.get(pid));
+
+    let session_name = app
         .selected_session()
-        .map(|s| s.metrics_line())
+        .map(|s| s.display_name.as_str())
+        .unwrap_or("?");
+    let status_text = app
+        .selected_session()
+        .map(|s| s.status_text())
         .unwrap_or_default();
+
+    // Build title with stats.
+    let stats_str = jstate
+        .map(|js| {
+            let mut parts = Vec::new();
+            if js.stats.total_input_tokens > 0 || js.stats.total_output_tokens > 0 {
+                parts.push(format!(
+                    "IN:{} OUT:{}",
+                    jsonl::format_tokens(js.stats.total_input_tokens),
+                    jsonl::format_tokens(js.stats.total_output_tokens)
+                ));
+            }
+            if js.stats.total_cost_usd > 0.0 {
+                parts.push(jsonl::format_cost(js.stats.total_cost_usd));
+            }
+            if js.stats.num_turns > 0 {
+                parts.push(format!("{} turns", js.stats.num_turns));
+            }
+            if let Some(ref model) = js.stats.model {
+                // Shorten model name for display.
+                let short = model
+                    .replace("claude-", "")
+                    .replace("-20250514", "");
+                parts.push(short);
+            }
+            if !parts.is_empty() {
+                format!(" {} ", parts.join(" | "))
+            } else {
+                String::new()
+            }
+        })
+        .unwrap_or_default();
+
+    let title = format!(" Output — {session_name} ({status_text}) [JSONL]{stats_str}");
+
+    // Handle graceful degradation states.
+    let Some(jstate) = jstate else {
+        let msg = Paragraph::new("No JSONL state. Switch to a session with JSONL data.")
+            .style(Style::default().fg(Color::DarkGray))
+            .block(Block::default().borders(Borders::ALL).title(title));
+        f.render_widget(msg, area);
+        return;
+    };
+
+    match &jstate.state {
+        JsonlViewState::NotFound => {
+            let msg = Paragraph::new("No JSONL file found. Watching for session logs...")
+                .style(Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC))
+                .block(Block::default().borders(Borders::ALL).title(title));
+            f.render_widget(msg, area);
+        }
+        JsonlViewState::Empty => {
+            let msg = Paragraph::new("Session active, no entries yet.")
+                .style(Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC))
+                .block(Block::default().borders(Borders::ALL).title(title));
+            f.render_widget(msg, area);
+        }
+        JsonlViewState::Error { message } => {
+            let msg = Paragraph::new(format!("JSONL error: {message}"))
+                .style(Style::default().fg(Color::Yellow))
+                .block(Block::default().borders(Borders::ALL).title(title));
+            f.render_widget(msg, area);
+        }
+        JsonlViewState::Loading { .. } | JsonlViewState::Ready => {
+            let is_loading = matches!(&jstate.state, JsonlViewState::Loading { .. });
+            let visible_height = area.height.saturating_sub(2) as usize;
+
+            // Build visible lines from entries.
+            let mut lines: Vec<Line> = Vec::new();
+            for entry in &jstate.entries {
+                match entry {
+                    ParsedEntry::Thinking { .. } if !app.show_thinking => continue,
+                    ParsedEntry::System { .. } | ParsedEntry::Progress { .. }
+                        if !app.show_system =>
+                    {
+                        continue;
+                    }
+                    _ => {}
+                }
+                render_entry_to_lines(entry, &mut lines);
+            }
+
+            if is_loading {
+                if let JsonlViewState::Loading { count } = &jstate.state {
+                    lines.push(Line::from(Span::styled(
+                        format!("Loading... ({count} entries)"),
+                        Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+                    )));
+                }
+            }
+
+            // Parse errors footer.
+            if jstate.stats.parse_errors > 0 {
+                lines.push(Line::from(Span::styled(
+                    format!("{} malformed entries skipped", jstate.stats.parse_errors),
+                    Style::default().fg(Color::Yellow),
+                )));
+            }
+
+            let total_lines = lines.len() as u16;
+            let scroll = if jstate.auto_scroll {
+                total_lines.saturating_sub(visible_height as u16)
+            } else {
+                total_lines
+                    .saturating_sub(visible_height as u16)
+                    .saturating_sub(jstate.scroll_offset)
+            };
+
+            let output_widget = Paragraph::new(lines)
+                .block(Block::default().borders(Borders::ALL).title(title))
+                .wrap(Wrap { trim: false })
+                .scroll((scroll, 0));
+
+            f.render_widget(output_widget, area);
+        }
+    }
+}
+
+/// Render a single ParsedEntry into display lines.
+fn render_entry_to_lines<'a>(entry: &ParsedEntry, lines: &mut Vec<Line<'a>>) {
+    match entry {
+        ParsedEntry::User { text, .. } => {
+            lines.push(Line::from(Span::styled(
+                format!("> {text}"),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            lines.push(Line::raw(""));
+        }
+        ParsedEntry::Assistant { blocks, .. } => {
+            for block in blocks {
+                match block {
+                    ContentBlock::Text(text) => {
+                        for line in text.lines() {
+                            lines.push(Line::from(Span::styled(
+                                line.to_string(),
+                                Style::default().fg(Color::White),
+                            )));
+                        }
+                    }
+                    // ToolUse/ToolResult/Thinking rendered as separate entries
+                    _ => {}
+                }
+            }
+            lines.push(Line::raw(""));
+        }
+        ParsedEntry::ToolUse { name, summary, .. } => {
+            let display = if summary.is_empty() {
+                format!("\u{1f527} {name}")
+            } else {
+                format!("\u{1f527} {name}: {summary}")
+            };
+            lines.push(Line::from(Span::styled(
+                display,
+                Style::default().fg(Color::Cyan),
+            )));
+        }
+        ParsedEntry::ToolResult { content, .. } => {
+            lines.push(Line::from(Span::styled(
+                content.clone(),
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+        ParsedEntry::Thinking { text, .. } => {
+            lines.push(Line::from(Span::styled(
+                format!("\u{1f4ad} [thinking...] {}", truncate_display(text, 100)),
+                Style::default().fg(Color::Magenta),
+            )));
+        }
+        ParsedEntry::System { subtype, text, .. } => {
+            let display = if text.is_empty() {
+                format!("[system: {subtype}]")
+            } else {
+                format!("[system: {subtype}] {text}")
+            };
+            lines.push(Line::from(Span::styled(
+                display,
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+        ParsedEntry::Progress { message, .. } => {
+            lines.push(Line::from(Span::styled(
+                format!("[progress] {message}"),
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+        ParsedEntry::Result {
+            cost,
+            duration_ms,
+            turns,
+            ..
+        } => {
+            let display = format!(
+                "--- Session complete: {} | {} turns | {} ---",
+                jsonl::format_cost(*cost),
+                turns,
+                jsonl::format_duration_ms(*duration_ms)
+            );
+            lines.push(Line::from(Span::styled(
+                display,
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            )));
+        }
+    }
+}
+
+fn truncate_display(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        s.to_string()
+    } else {
+        format!("{}...", &s[..max])
+    }
+}
+
+/// Render the session info bar with process metrics or JSONL stats.
+fn render_session_info(f: &mut Frame, area: Rect, app: &App) {
+    let info = match app.view_mode {
+        ViewMode::Raw => app
+            .selected_session()
+            .map(|s| s.metrics_line())
+            .unwrap_or_default(),
+        ViewMode::Jsonl => {
+            if let Some(pane_id) = app.selected_session().map(|s| &s.pane_id) {
+                if let Some(jstate) = app.jsonl_states.get(pane_id) {
+                    let s = &jstate.stats;
+                    let mut parts = Vec::new();
+                    parts.push(format!(
+                        "IN:{}  OUT:{}",
+                        jsonl::format_tokens(s.total_input_tokens),
+                        jsonl::format_tokens(s.total_output_tokens)
+                    ));
+                    if s.total_cache_read > 0 || s.total_cache_creation > 0 {
+                        parts.push(format!(
+                            "CACHE:{}r/{}w",
+                            jsonl::format_tokens(s.total_cache_read),
+                            jsonl::format_tokens(s.total_cache_creation)
+                        ));
+                    }
+                    parts.push(jsonl::format_cost(s.total_cost_usd));
+                    parts.push(format!("{} turns", s.num_turns));
+                    if let Some(ref m) = s.model {
+                        parts.push(m.clone());
+                    }
+                    if s.parse_errors > 0 {
+                        parts.push(format!("{} skipped", s.parse_errors));
+                    }
+                    parts.join("  ")
+                } else {
+                    "No JSONL data".to_string()
+                }
+            } else {
+                String::new()
+            }
+        }
+    };
 
     let bar = Paragraph::new(Line::from(vec![
         Span::styled(" ", Style::default()),
@@ -216,6 +494,17 @@ fn render_status_bar(f: &mut Frame, area: Rect, app: &App) {
         ),
     };
 
+    let view_mode_indicator = match app.view_mode {
+        ViewMode::Raw => Span::styled(
+            " [RAW] ",
+            Style::default().fg(Color::White).bg(Color::DarkGray),
+        ),
+        ViewMode::Jsonl => Span::styled(
+            " [JSONL] ",
+            Style::default().fg(Color::Black).bg(Color::Cyan),
+        ),
+    };
+
     let session_count = Span::raw(format!(" {} sessions ", app.sessions.len()));
 
     let status_msg = app
@@ -247,14 +536,19 @@ fn render_status_bar(f: &mut Frame, area: Rect, app: &App) {
     let right_display = format!(" \u{2387} {}{} \u{2502} {} ", branch, pr_suffix, cwd);
 
     // Calculate left side width to pad with spaces for right-alignment.
-    let left_parts = format!(" {} {} sessions  {status_msg}", match app.input_mode {
+    let view_tag = match app.view_mode {
+        ViewMode::Raw => "[RAW]",
+        ViewMode::Jsonl => "[JSONL]",
+    };
+    let left_parts = format!(" {} {} {} sessions  {status_msg}", match app.input_mode {
         InputMode::Normal => "NORMAL",
         InputMode::Insert => "INSERT",
-    }, app.sessions.len());
+    }, view_tag, app.sessions.len());
     let padding = (area.width as usize).saturating_sub(left_parts.len() + right_display.len());
 
     let bar = Paragraph::new(Line::from(vec![
         mode_indicator,
+        view_mode_indicator,
         session_count,
         Span::styled(
             format!(" {status_msg}"),

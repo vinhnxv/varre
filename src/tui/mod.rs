@@ -21,7 +21,7 @@ use crate::monitor::MonitorTask;
 use crate::tmux::scanner::TmuxScanner;
 use crate::tmux::TmuxWrapper;
 
-use app::{App, InputMode};
+use app::{App, InputMode, ViewMode};
 use event::AppEvent;
 
 /// Run the TUI application with auto-discovery of Claude Code sessions.
@@ -121,7 +121,54 @@ pub async fn run(config: Config, cancel_token: CancellationToken) -> Result<()> 
         while let Ok(evt) = event_rx.try_recv() {
             match evt {
                 AppEvent::SessionsRefreshed(sessions) => {
+                    // Before updating sessions, do incremental JSONL reads.
+                    for session in &sessions {
+                        if let Some(ref jsonl_path) = session.jsonl_path {
+                            let pane_id = session.pane_id.clone();
+                            let jstate = app
+                                .jsonl_states
+                                .entry(pane_id)
+                                .or_default();
+
+                            // Initialize tailer if needed or path changed.
+                            let needs_init = jstate.tailer.is_none()
+                                || jstate.path.as_ref() != Some(jsonl_path);
+
+                            if needs_init {
+                                jstate.path = Some(jsonl_path.clone());
+                                if let Some(mut tailer) = crate::jsonl::JsonlTailer::new(jsonl_path.clone()) {
+                                    let (entries, errors) = tailer.read_all();
+                                    jstate.stats = crate::jsonl::JsonlStats::default();
+                                    jstate.stats.update_from_entries(&entries);
+                                    jstate.stats.parse_errors = errors;
+                                    jstate.entries = entries;
+                                    if jstate.entries.is_empty() {
+                                        jstate.state = crate::jsonl::JsonlViewState::Empty;
+                                    } else {
+                                        jstate.state = crate::jsonl::JsonlViewState::Ready;
+                                    }
+                                    jstate.tailer = Some(tailer);
+                                }
+                            } else if let Some(ref mut tailer) = jstate.tailer {
+                                let (new_entries, errors) = tailer.read_new();
+                                if !new_entries.is_empty() || errors > 0 {
+                                    jstate.append_entries(new_entries, errors);
+                                }
+                            }
+                        }
+                    }
                     app.update_sessions(sessions);
+                }
+                AppEvent::JsonlUpdated {
+                    pane_id,
+                    new_entries,
+                    stats_delta: _,
+                } => {
+                    let jstate = app
+                        .jsonl_states
+                        .entry(pane_id)
+                        .or_default();
+                    jstate.append_entries(new_entries, 0);
                 }
                 AppEvent::Resize(w, h) => {
                     app.terminal_size = (w, h);
@@ -197,6 +244,21 @@ async fn handle_key_event(
                         }
                     }
                 }
+            }
+            KeyCode::Tab => {
+                app.view_mode = app.view_mode.toggle();
+            }
+            KeyCode::Char('1') => {
+                app.view_mode = ViewMode::Raw;
+            }
+            KeyCode::Char('2') => {
+                app.view_mode = ViewMode::Jsonl;
+            }
+            KeyCode::Char('t') if app.view_mode == ViewMode::Jsonl => {
+                app.show_thinking = !app.show_thinking;
+            }
+            KeyCode::Char('s') if app.view_mode == ViewMode::Jsonl => {
+                app.show_system = !app.show_system;
             }
             KeyCode::Char('r') => {
                 app.status_message = Some("Refresh scheduled (next scan cycle)".to_string());

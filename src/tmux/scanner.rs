@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use anyhow::{Context, Result};
 use tokio::process::Command;
 
@@ -53,6 +55,8 @@ pub struct DiscoveredSession {
     pub pane_size: (u16, u16),
     /// Process metrics (PID, CPU, MEM, etc.).
     pub metrics: ProcessMetrics,
+    /// Path to the most recent JSONL session log (if discovered).
+    pub jsonl_path: Option<PathBuf>,
 }
 
 /// Scans all tmux panes for running Claude Code sessions.
@@ -217,6 +221,13 @@ impl TmuxScanner {
             None
         };
 
+        // Discover JSONL path using CWD + config dir.
+        let jsonl_path = if let Some(ref cwd) = metrics.cwd {
+            crate::jsonl::resolve_jsonl_path(cwd, metrics.claude_config_dir.as_deref())
+        } else {
+            None
+        };
+
         Ok(Some(DiscoveredSession {
             tmux_session: pane.session_name.clone(),
             tmux_window: pane.window_index,
@@ -226,6 +237,7 @@ impl TmuxScanner {
             pane_content: lines,
             pane_size: (pane.width, pane.height),
             metrics,
+            jsonl_path,
         }))
     }
 
@@ -685,6 +697,22 @@ mod tests {
         let line = "sess:0:%2::80:24";
         let pane = RawPane::parse(line).expect("should parse");
         assert_eq!(pane.pane_pid, None);
+    }
+
+    #[test]
+    fn test_discovered_session_jsonl_field() {
+        let session = DiscoveredSession {
+            tmux_session: "test".into(),
+            tmux_window: 0,
+            pane_id: "%1".into(),
+            pane_pid: None,
+            claude_status: ClaudeStatus::Idle,
+            pane_content: vec![],
+            pane_size: (200, 50),
+            metrics: ProcessMetrics::default(),
+            jsonl_path: None,
+        };
+        assert!(session.jsonl_path.is_none());
     }
 
     #[test]

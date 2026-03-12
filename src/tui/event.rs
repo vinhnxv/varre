@@ -1,5 +1,6 @@
 use crossterm::event::KeyEvent;
 
+use crate::jsonl::{JsonlStats, ParsedEntry};
 use crate::tmux::scanner::DiscoveredSession;
 
 /// Events processed by the TUI application.
@@ -13,4 +14,10 @@ pub enum AppEvent {
     SessionsRefreshed(Vec<DiscoveredSession>),
     /// Terminal resize.
     Resize(u16, u16),
+    /// New JSONL entries parsed for a session.
+    JsonlUpdated {
+        pane_id: String,
+        new_entries: Vec<ParsedEntry>,
+        stats_delta: JsonlStats,
+    },
 }
