@@ -314,6 +314,91 @@ fn render_jsonl_output(f: &mut Frame, area: Rect, app: &App) {
 // cclv-style entry rendering (solarized dark)
 // ---------------------------------------------------------------------------
 
+/// Check if a user message is system boilerplate (e.g. "Caveat: The messages below…").
+fn is_system_boilerplate(text: &str) -> bool {
+    let t = text.trim();
+    t.starts_with("Caveat: The messages below were generated")
+        || t.starts_with("Note: ")
+        || (t.starts_with("The messages below") && t.contains("DO NOT respond"))
+}
+
+/// Manually wrap `text` to `max_width` chars, returning wrapped lines.
+fn wrap_text(text: &str, max_width: usize) -> Vec<String> {
+    if max_width == 0 {
+        return vec![text.to_string()];
+    }
+    let mut result = Vec::new();
+    for logical_line in text.lines() {
+        if logical_line.is_empty() {
+            result.push(String::new());
+            continue;
+        }
+        let mut remaining = logical_line;
+        while !remaining.is_empty() {
+            if remaining.len() <= max_width {
+                result.push(remaining.to_string());
+                break;
+            }
+            // Find a break point — prefer space within max_width.
+            let break_at = remaining[..max_width]
+                .rfind(' ')
+                .map(|pos| pos + 1) // include the space
+                .unwrap_or(max_width);
+            result.push(remaining[..break_at].to_string());
+            remaining = &remaining[break_at..];
+        }
+    }
+    result
+}
+
+/// Push wrapped body lines with the continuation prefix.
+fn push_body_lines<'a>(
+    lines: &mut Vec<Line<'a>>,
+    text_lines: &[String],
+    style: Style,
+    cont_prefix: &str,
+    idx_style: Style,
+    max_width: usize,
+    collapse_threshold: usize,
+    summary_count: usize,
+) {
+    let mut all_wrapped: Vec<String> = Vec::new();
+    for line in text_lines {
+        if line.is_empty() {
+            all_wrapped.push(String::new());
+        } else {
+            all_wrapped.extend(wrap_text(line, max_width));
+        }
+    }
+
+    let display_lines: &[String];
+    let mut remaining_msg: Option<usize> = None;
+
+    if all_wrapped.len() > collapse_threshold {
+        display_lines = &all_wrapped[..summary_count];
+        remaining_msg = Some(all_wrapped.len() - summary_count);
+    } else {
+        display_lines = &all_wrapped;
+    }
+
+    for line in display_lines {
+        lines.push(Line::from(vec![
+            Span::styled(cont_prefix.to_string(), idx_style),
+            Span::styled(line.clone(), style),
+        ]));
+    }
+
+    if let Some(remaining) = remaining_msg {
+        lines.push(Line::from(vec![
+            Span::styled(cont_prefix.to_string(), idx_style),
+            Span::styled(
+                format!("(+{remaining} more lines)"),
+                Style::default().fg(sol::BASE01),
+            ),
+        ]));
+    }
+}
+
 fn render_entry_cclv<'a>(
     entry: &ParsedEntry,
     num: usize,
@@ -325,11 +410,14 @@ fn render_entry_cclv<'a>(
 ) {
     let idx_style = Style::default().fg(sol::BASE01);
     let idx_prefix = format!("\u{2502}{:>3} ", num);
-    let cont_prefix = "\u{2502}    ".to_string();
+    let cont_prefix = "\u{2502}    ";
+    let prefix_width = 5; // "│    " = 5 chars
+    let text_width = content_width.saturating_sub(prefix_width + 1);
 
     match entry {
         ParsedEntry::User { text, .. } => {
-            if num > 1 {
+            // Show token divider only when there are actual tokens.
+            if num > 1 && (cum_in > 0 || cum_out > 0) {
                 render_token_divider(lines, content_width, cum_in, cum_out, cum_cost);
             }
             lines.push(Line::from(vec![
@@ -339,20 +427,20 @@ fn render_entry_cclv<'a>(
                     Style::default().fg(sol::CYAN).add_modifier(Modifier::BOLD),
                 ),
             ]));
-            // Filter out system XML tags from user messages
             let cleaned = strip_xml_tags(text);
             let cleaned = cleaned.trim();
-            if !cleaned.is_empty() {
-                for line in cleaned.lines() {
-                    let line = line.trim();
-                    if line.is_empty() {
-                        continue;
-                    }
-                    lines.push(Line::from(vec![
-                        Span::styled(cont_prefix.clone(), idx_style),
-                        Span::styled(line.to_string(), Style::default().fg(sol::CYAN)),
-                    ]));
-                }
+            if !cleaned.is_empty() && !is_system_boilerplate(cleaned) {
+                let body: Vec<String> = cleaned
+                    .lines()
+                    .filter(|l| !l.trim().is_empty())
+                    .map(|l| l.trim().to_string())
+                    .collect();
+                push_body_lines(
+                    lines, &body,
+                    Style::default().fg(sol::CYAN),
+                    cont_prefix, idx_style, text_width,
+                    20, 5,
+                );
             }
         }
         ParsedEntry::Assistant { blocks, model, .. } => {
@@ -378,31 +466,12 @@ fn render_entry_cclv<'a>(
                     }
                 }
             }
-            let collapse_threshold = 10;
-            let summary_count = 3;
-            if text_lines.len() > collapse_threshold {
-                for line in text_lines.iter().take(summary_count) {
-                    lines.push(Line::from(vec![
-                        Span::styled(cont_prefix.clone(), idx_style),
-                        Span::styled(line.clone(), Style::default().fg(sol::BASE0)),
-                    ]));
-                }
-                let remaining = text_lines.len() - summary_count;
-                lines.push(Line::from(vec![
-                    Span::styled(cont_prefix.clone(), idx_style),
-                    Span::styled(
-                        format!("(+{remaining} more lines)"),
-                        Style::default().fg(sol::BASE01),
-                    ),
-                ]));
-            } else {
-                for line in &text_lines {
-                    lines.push(Line::from(vec![
-                        Span::styled(cont_prefix.clone(), idx_style),
-                        Span::styled(line.clone(), Style::default().fg(sol::BASE0)),
-                    ]));
-                }
-            }
+            push_body_lines(
+                lines, &text_lines,
+                Style::default().fg(sol::BASE0),
+                cont_prefix, idx_style, text_width,
+                10, 3,
+            );
         }
         ParsedEntry::ToolUse { name, summary, .. } => {
             lines.push(Line::from(vec![
@@ -413,36 +482,24 @@ fn render_entry_cclv<'a>(
                 ),
             ]));
             if !summary.is_empty() {
-                lines.push(Line::from(vec![
-                    Span::styled(cont_prefix.clone(), idx_style),
-                    Span::styled(
-                        format!("  {summary}"),
-                        Style::default().fg(sol::YELLOW),
-                    ),
-                ]));
+                let sum_lines: Vec<String> = vec![summary.clone()];
+                push_body_lines(
+                    lines, &sum_lines,
+                    Style::default().fg(sol::YELLOW),
+                    cont_prefix, idx_style, text_width,
+                    5, 3,
+                );
             }
         }
         ParsedEntry::ToolResult { content, .. } => {
             if !content.is_empty() {
-                let result_lines: Vec<&str> = content.lines().collect();
-                let max_lines = 5;
-                let show = result_lines.len().min(max_lines);
-                for line in result_lines.iter().take(show) {
-                    lines.push(Line::from(vec![
-                        Span::styled(cont_prefix.clone(), idx_style),
-                        Span::styled(line.to_string(), Style::default().fg(sol::BASE01)),
-                    ]));
-                }
-                if result_lines.len() > max_lines {
-                    let remaining = result_lines.len() - max_lines;
-                    lines.push(Line::from(vec![
-                        Span::styled(cont_prefix.clone(), idx_style),
-                        Span::styled(
-                            format!("(+{remaining} more lines)"),
-                            Style::default().fg(sol::BASE01),
-                        ),
-                    ]));
-                }
+                let result_lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
+                push_body_lines(
+                    lines, &result_lines,
+                    Style::default().fg(sol::BASE01),
+                    cont_prefix, idx_style, text_width,
+                    5, 3,
+                );
             }
         }
         ParsedEntry::Thinking { text, .. } => {
@@ -455,27 +512,13 @@ fn render_entry_cclv<'a>(
                         .add_modifier(Modifier::ITALIC),
                 ),
             ]));
-            let think_lines: Vec<&str> = text.lines().collect();
-            let max = 3;
-            for line in think_lines.iter().take(max) {
-                lines.push(Line::from(vec![
-                    Span::styled(cont_prefix.clone(), idx_style),
-                    Span::styled(
-                        line.to_string(),
-                        Style::default().fg(sol::VIOLET).add_modifier(Modifier::ITALIC),
-                    ),
-                ]));
-            }
-            if think_lines.len() > max {
-                let remaining = think_lines.len() - max;
-                lines.push(Line::from(vec![
-                    Span::styled(cont_prefix.clone(), idx_style),
-                    Span::styled(
-                        format!("(+{remaining} more lines)"),
-                        Style::default().fg(sol::BASE01),
-                    ),
-                ]));
-            }
+            let think_lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
+            push_body_lines(
+                lines, &think_lines,
+                Style::default().fg(sol::VIOLET).add_modifier(Modifier::ITALIC),
+                cont_prefix, idx_style, text_width,
+                5, 3,
+            );
         }
         ParsedEntry::System { subtype, text, .. } => {
             let display = if text.is_empty() {
