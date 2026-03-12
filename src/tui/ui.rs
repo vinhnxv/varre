@@ -226,9 +226,15 @@ fn render_jsonl_output(f: &mut Frame, area: Rect, app: &App) {
         JsonlViewState::Loading { .. } | JsonlViewState::Ready => {
             let is_loading = matches!(&jstate.state, JsonlViewState::Loading { .. });
             let visible_height = area.height.saturating_sub(2) as usize;
+            let content_width = area.width.saturating_sub(2) as usize; // minus borders
 
-            // Build visible lines from entries.
+            // Build visible lines from entries with cclv-style formatting.
             let mut lines: Vec<Line> = Vec::new();
+            let mut entry_num: usize = 0;
+            let mut cumulative_input: u64 = 0;
+            let mut cumulative_output: u64 = 0;
+            let mut cumulative_cost: f64 = 0.0;
+
             for entry in &jstate.entries {
                 match entry {
                     ParsedEntry::Thinking { .. } if !app.show_thinking => continue,
@@ -239,22 +245,35 @@ fn render_jsonl_output(f: &mut Frame, area: Rect, app: &App) {
                     }
                     _ => {}
                 }
-                render_entry_to_lines(entry, &mut lines);
+
+                // Track cumulative stats for token dividers.
+                if let ParsedEntry::Assistant { usage, .. } = entry {
+                    if let Some(u) = usage {
+                        cumulative_input += u.input_tokens.unwrap_or(0);
+                        cumulative_output += u.output_tokens.unwrap_or(0);
+                    }
+                }
+                if let ParsedEntry::Result { cost, .. } = entry {
+                    cumulative_cost = *cost;
+                }
+
+                entry_num += 1;
+                render_entry_cclv(entry, entry_num, &mut lines, content_width,
+                    cumulative_input, cumulative_output, cumulative_cost);
             }
 
             if is_loading {
                 if let JsonlViewState::Loading { count } = &jstate.state {
                     lines.push(Line::from(Span::styled(
-                        format!("Loading... ({count} entries)"),
+                        format!("  Loading... ({count} entries)"),
                         Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
                     )));
                 }
             }
 
-            // Parse errors footer.
             if jstate.stats.parse_errors > 0 {
                 lines.push(Line::from(Span::styled(
-                    format!("{} malformed entries skipped", jstate.stats.parse_errors),
+                    format!("  {} malformed entries skipped", jstate.stats.parse_errors),
                     Style::default().fg(Color::Yellow),
                 )));
             }
@@ -278,74 +297,216 @@ fn render_jsonl_output(f: &mut Frame, area: Rect, app: &App) {
     }
 }
 
-/// Render a single ParsedEntry into display lines.
-fn render_entry_to_lines<'a>(entry: &ParsedEntry, lines: &mut Vec<Line<'a>>) {
+// ---------------------------------------------------------------------------
+// cclv-inspired entry rendering
+// ---------------------------------------------------------------------------
+
+/// Render a single ParsedEntry with cclv-style formatting.
+fn render_entry_cclv<'a>(
+    entry: &ParsedEntry,
+    num: usize,
+    lines: &mut Vec<Line<'a>>,
+    content_width: usize,
+    cum_input: u64,
+    cum_output: u64,
+    cum_cost: f64,
+) {
+    let idx_style = Style::default().fg(Color::DarkGray);
+    let idx_prefix = format!("\u{2502}{:>3} ", num); // │NNN
+    let cont_prefix = format!("\u{2502}    "); // │    (continuation indent)
+
     match entry {
         ParsedEntry::User { text, .. } => {
-            lines.push(Line::from(Span::styled(
-                format!("> {text}"),
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            )));
-            lines.push(Line::raw(""));
+            // ── Token divider before user messages (conversation turn boundary)
+            if num > 1 {
+                render_token_divider(lines, content_width, cum_input, cum_output, cum_cost);
+            }
+            // Role label line
+            lines.push(Line::from(vec![
+                Span::styled(idx_prefix.clone(), idx_style),
+                Span::styled(
+                    "User",
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                ),
+            ]));
+            // User text (cyan, matching cclv)
+            for line in text.lines() {
+                lines.push(Line::from(vec![
+                    Span::styled(cont_prefix.clone(), idx_style),
+                    Span::styled(line.to_string(), Style::default().fg(Color::Cyan)),
+                ]));
+            }
         }
-        ParsedEntry::Assistant { blocks, .. } => {
+        ParsedEntry::Assistant { blocks, model, .. } => {
+            // Role label with model info
+            let model_tag = model
+                .as_ref()
+                .map(|m| {
+                    let short = m.replace("claude-", "").replace("-20250514", "");
+                    format!(" [{short}]")
+                })
+                .unwrap_or_default();
+            lines.push(Line::from(vec![
+                Span::styled(idx_prefix.clone(), idx_style),
+                Span::styled(
+                    format!("Assistant{model_tag}"),
+                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                ),
+            ]));
+            // Render text blocks only (tool use rendered as separate entries)
+            let mut text_lines: Vec<String> = Vec::new();
             for block in blocks {
-                match block {
-                    ContentBlock::Text(text) => {
-                        for line in text.lines() {
-                            lines.push(Line::from(Span::styled(
-                                line.to_string(),
-                                Style::default().fg(Color::White),
-                            )));
-                        }
+                if let ContentBlock::Text(text) = block {
+                    for line in text.lines() {
+                        text_lines.push(line.to_string());
                     }
-                    // ToolUse/ToolResult/Thinking rendered as separate entries
-                    _ => {}
                 }
             }
-            lines.push(Line::raw(""));
+            // Collapse long messages (>10 lines)
+            let collapse_threshold = 10;
+            let summary_lines = 3;
+            if text_lines.len() > collapse_threshold {
+                for line in text_lines.iter().take(summary_lines) {
+                    lines.push(Line::from(vec![
+                        Span::styled(cont_prefix.clone(), idx_style),
+                        Span::styled(line.clone(), Style::default().fg(Color::Green)),
+                    ]));
+                }
+                let remaining = text_lines.len() - summary_lines;
+                lines.push(Line::from(vec![
+                    Span::styled(cont_prefix.clone(), idx_style),
+                    Span::styled(
+                        format!("(+{remaining} more lines)"),
+                        Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+                    ),
+                ]));
+            } else {
+                for line in &text_lines {
+                    lines.push(Line::from(vec![
+                        Span::styled(cont_prefix.clone(), idx_style),
+                        Span::styled(line.clone(), Style::default().fg(Color::Green)),
+                    ]));
+                }
+            }
         }
         ParsedEntry::ToolUse { name, summary, .. } => {
-            let display = if summary.is_empty() {
-                format!("\u{1f527} {name}")
+            // Tool use: yellow bold header with summary
+            let tool_line = if summary.is_empty() {
+                format!("\u{1f527} Tool: {name}")
             } else {
-                format!("\u{1f527} {name}: {summary}")
+                format!("\u{1f527} Tool: {name}")
             };
-            lines.push(Line::from(Span::styled(
-                display,
-                Style::default().fg(Color::Cyan),
-            )));
+            lines.push(Line::from(vec![
+                Span::styled(idx_prefix.clone(), idx_style),
+                Span::styled(
+                    tool_line,
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                ),
+            ]));
+            if !summary.is_empty() {
+                // Indented parameter summary
+                lines.push(Line::from(vec![
+                    Span::styled(cont_prefix.clone(), idx_style),
+                    Span::styled(
+                        format!("  {summary}"),
+                        Style::default().fg(Color::Yellow),
+                    ),
+                ]));
+            }
         }
         ParsedEntry::ToolResult { content, .. } => {
-            lines.push(Line::from(Span::styled(
-                content.clone(),
-                Style::default().fg(Color::DarkGray),
-            )));
+            if !content.is_empty() {
+                // Collapse long tool results
+                let result_lines: Vec<&str> = content.lines().collect();
+                let max_result_lines = 5;
+                if result_lines.len() > max_result_lines {
+                    for line in result_lines.iter().take(max_result_lines) {
+                        lines.push(Line::from(vec![
+                            Span::styled(cont_prefix.clone(), idx_style),
+                            Span::styled(
+                                line.to_string(),
+                                Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+                            ),
+                        ]));
+                    }
+                    let remaining = result_lines.len() - max_result_lines;
+                    lines.push(Line::from(vec![
+                        Span::styled(cont_prefix.clone(), idx_style),
+                        Span::styled(
+                            format!("(+{remaining} more lines)"),
+                            Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+                        ),
+                    ]));
+                } else {
+                    for line in &result_lines {
+                        lines.push(Line::from(vec![
+                            Span::styled(cont_prefix.clone(), idx_style),
+                            Span::styled(
+                                line.to_string(),
+                                Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+                            ),
+                        ]));
+                    }
+                }
+            }
         }
         ParsedEntry::Thinking { text, .. } => {
-            lines.push(Line::from(Span::styled(
-                format!("\u{1f4ad} [thinking...] {}", truncate_display(text, 100)),
-                Style::default().fg(Color::Magenta),
-            )));
+            lines.push(Line::from(vec![
+                Span::styled(idx_prefix.clone(), idx_style),
+                Span::styled(
+                    "\u{1f4ad} Thinking",
+                    Style::default()
+                        .fg(Color::Magenta)
+                        .add_modifier(Modifier::ITALIC | Modifier::DIM),
+                ),
+            ]));
+            // Show first few lines of thinking, collapsed
+            let think_lines: Vec<&str> = text.lines().collect();
+            let max_think = 3;
+            for line in think_lines.iter().take(max_think) {
+                lines.push(Line::from(vec![
+                    Span::styled(cont_prefix.clone(), idx_style),
+                    Span::styled(
+                        line.to_string(),
+                        Style::default()
+                            .fg(Color::Magenta)
+                            .add_modifier(Modifier::ITALIC | Modifier::DIM),
+                    ),
+                ]));
+            }
+            if think_lines.len() > max_think {
+                let remaining = think_lines.len() - max_think;
+                lines.push(Line::from(vec![
+                    Span::styled(cont_prefix.clone(), idx_style),
+                    Span::styled(
+                        format!("(+{remaining} more lines)"),
+                        Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+                    ),
+                ]));
+            }
         }
         ParsedEntry::System { subtype, text, .. } => {
             let display = if text.is_empty() {
                 format!("[system: {subtype}]")
             } else {
-                format!("[system: {subtype}] {text}")
+                format!("[system: {subtype}] {}", truncate_display(text, 80))
             };
-            lines.push(Line::from(Span::styled(
-                display,
-                Style::default().fg(Color::DarkGray),
-            )));
+            lines.push(Line::from(vec![
+                Span::styled(idx_prefix.clone(), idx_style),
+                Span::styled(
+                    display,
+                    Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+                ),
+            ]));
         }
         ParsedEntry::Progress { message, .. } => {
-            lines.push(Line::from(Span::styled(
-                format!("[progress] {message}"),
-                Style::default().fg(Color::DarkGray),
-            )));
+            lines.push(Line::from(vec![
+                Span::styled(idx_prefix.clone(), idx_style),
+                Span::styled(
+                    format!("\u{25cb} {message}"),
+                    Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+                ),
+            ]));
         }
         ParsedEntry::Result {
             cost,
@@ -353,20 +514,68 @@ fn render_entry_to_lines<'a>(entry: &ParsedEntry, lines: &mut Vec<Line<'a>>) {
             turns,
             ..
         } => {
-            let display = format!(
-                "--- Session complete: {} | {} turns | {} ---",
-                jsonl::format_cost(*cost),
-                turns,
-                jsonl::format_duration_ms(*duration_ms)
-            );
+            // Full-width separator
+            let divider_char = "\u{2500}"; // ─
+            let divider = divider_char.repeat(content_width.saturating_sub(2));
             lines.push(Line::from(Span::styled(
-                display,
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
+                divider,
+                Style::default().fg(Color::Green).add_modifier(Modifier::DIM),
+            )));
+            lines.push(Line::from(vec![
+                Span::styled("  ", Style::default()),
+                Span::styled(
+                    format!(
+                        "\u{2714} Session complete: {} | {} turns | {}",
+                        jsonl::format_cost(*cost),
+                        turns,
+                        jsonl::format_duration_ms(*duration_ms)
+                    ),
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]));
+            let divider = divider_char.repeat(content_width.saturating_sub(2));
+            lines.push(Line::from(Span::styled(
+                divider,
+                Style::default().fg(Color::Green).add_modifier(Modifier::DIM),
             )));
         }
     }
+}
+
+/// Render a cclv-style token divider between conversation turns.
+fn render_token_divider<'a>(
+    lines: &mut Vec<Line<'a>>,
+    content_width: usize,
+    cum_input: u64,
+    cum_output: u64,
+    cum_cost: f64,
+) {
+    let stats = format!(
+        " \u{2193}{} \u{2191}{} {}",
+        jsonl::format_tokens(cum_input),
+        jsonl::format_tokens(cum_output),
+        if cum_cost > 0.0 {
+            format!("/ {}", jsonl::format_cost(cum_cost))
+        } else {
+            String::new()
+        }
+    );
+    let dash = "\u{2500}"; // ─
+    let stats_len = stats.chars().count();
+    let left_dashes = 2;
+    let right_dashes = content_width.saturating_sub(left_dashes + stats_len + 1);
+    let divider = format!(
+        "{}{}{}",
+        dash.repeat(left_dashes),
+        stats,
+        dash.repeat(right_dashes),
+    );
+    lines.push(Line::from(Span::styled(
+        divider,
+        Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+    )));
 }
 
 fn truncate_display(s: &str, max: usize) -> String {
