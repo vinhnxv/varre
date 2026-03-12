@@ -74,6 +74,28 @@ pub async fn run<B: crate::backend::ClaudeBackend + 'static>(
     // Load existing sessions
     refresh_sessions(&mut app, orchestrator).await;
 
+    // Orphan detection: find tmux sessions with varre prefix not in our store
+    if let Ok(tmux_sessions) = tmux.list_sessions().await {
+        let known_names: std::collections::HashSet<&str> =
+            app.sessions.iter().map(|s| s.name.as_str()).collect();
+        let orphans: Vec<_> = tmux_sessions
+            .iter()
+            .filter(|ts| !known_names.contains(ts.name.as_str()))
+            .collect();
+        if !orphans.is_empty() {
+            let names: Vec<&str> = orphans.iter().map(|o| o.name.as_str()).collect();
+            tracing::warn!(
+                orphans = ?names,
+                "found orphaned tmux sessions with varre prefix"
+            );
+            app.status_message = Some(format!(
+                "Found {} orphaned tmux session(s): {}",
+                orphans.len(),
+                names.join(", ")
+            ));
+        }
+    }
+
     // Start polling for existing interactive sessions
     start_polling_for_sessions(&mut app, &mut session_mgr, &tmux, &config);
 
