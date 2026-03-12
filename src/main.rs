@@ -2,6 +2,7 @@ mod backend;
 mod cli;
 mod config;
 mod error;
+mod monitor;
 mod orchestrator;
 mod queue;
 mod session;
@@ -191,9 +192,7 @@ async fn main() -> Result<()> {
         }
 
         Commands::Tui => {
-            let backend = Arc::new(CliBackend::with_binary(&config.claude.binary));
-            let mut orch = Orchestrator::new(config.clone(), backend, cancel_token.clone())?;
-            tui::run(config, &mut orch, cancel_token).await?;
+            tui::run(config, cancel_token).await?;
         }
     }
 

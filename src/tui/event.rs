@@ -1,7 +1,6 @@
 use crossterm::event::KeyEvent;
 
-use crate::session::SessionId;
-use crate::tmux::detection::ClaudeStatus;
+use crate::tmux::scanner::DiscoveredSession;
 
 /// Events processed by the TUI application.
 #[derive(Debug)]
@@ -10,12 +9,8 @@ pub enum AppEvent {
     Key(KeyEvent),
     /// Periodic tick for UI refresh.
     Tick,
-    /// Status update from a session's polling task.
-    SessionUpdate {
-        id: SessionId,
-        status: ClaudeStatus,
-        output: Vec<String>,
-    },
+    /// All discovered Claude Code sessions from a monitor scan.
+    SessionsRefreshed(Vec<DiscoveredSession>),
     /// Terminal resize.
     Resize(u16, u16),
 }

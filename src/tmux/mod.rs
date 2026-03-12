@@ -1,4 +1,5 @@
 pub mod detection;
+pub mod scanner;
 
 use std::time::Duration;
 
